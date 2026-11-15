@@ -1,3 +1,4 @@
+import re
 from datetime import date
 
 from mls.models import Property
@@ -17,6 +18,25 @@ def _year_from_approximate_age(raw) -> int | None:
     if age is None or age < 0 or age >= 300:
         return None
     return date.today().year - age
+
+
+def _year_from_remarks(remarks) -> int | None:
+    """Parse '4-year-new' / 'built in 2022' from PublicRemarks when YearBuilt is blank."""
+    text = safe_str(remarks)
+    if not text:
+        return None
+    built_in = re.search(r"\bbuilt\s+in\s+(\d{4})\b", text, re.I)
+    if built_in:
+        year = int(built_in.group(1))
+        current = date.today().year
+        if 1800 <= year <= current + 1:
+            return year
+    age_new = re.search(r"(\d+)\s*[- ]?\s*year(?:s)?[ -]?new\b", text, re.I)
+    if age_new:
+        age = int(age_new.group(1))
+        if 0 <= age < 300:
+            return date.today().year - age
+    return None
 
 
 def _living_area_fields(data) -> dict:
@@ -172,7 +192,8 @@ def map_property_defaults(data):
         ),
         "year_built": safe_int(data.get("YearBuilt"))
         or _year_from_approximate_age(data.get("ApproximateAge"))
-        or _year_from_approximate_age(data.get("PropertyAge")),
+        or _year_from_approximate_age(data.get("PropertyAge"))
+        or _year_from_remarks(data.get("PublicRemarks")),
         "bathrooms_partial": safe_int(data.get("BathroomsPartial")),
         "bathrooms_total_integer": safe_int(
             data.get("BathroomsTotalInteger")
