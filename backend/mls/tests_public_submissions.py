@@ -57,3 +57,7 @@ class HomeTypeFilterTests(SimpleTestCase):
         self.assertIn("Row / Townhouse", str(combined))
         detached = str(home_type_q(QueryDict("home_type=detached")))
         self.assertIn("property_attached_yn", detached)
+        semi = str(home_type_q(QueryDict("home_type=semi")))
+        self.assertIn("Semi-Detached", semi)
+        condo = str(home_type_q(QueryDict("home_type=condo")))
+        self.assertIn("Condo Apartment", condo)

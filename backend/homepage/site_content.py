@@ -882,6 +882,42 @@ def _seo(document: dict, errors: dict) -> dict:
     }
 
 
+def _curated_listing_keys(raw, path: str, errors: dict) -> list[str]:
+    """Normalize pinned MLS® / listing keys (max 50). Accepts list or comma text."""
+    import re
+
+    parts: list[str] = []
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, str):
+                parts.extend(re.split(r"[\s,;]+", entry))
+    elif isinstance(raw, str):
+        parts.extend(re.split(r"[\s,;]+", raw))
+    else:
+        _err(errors, path, "Pinned listings must be a list of MLS® numbers.")
+        return []
+
+    seen: set[str] = set()
+    keys: list[str] = []
+    key_re = re.compile(r"^[A-Z0-9][A-Z0-9._-]{2,39}$", re.I)
+    for part in parts:
+        key = part.strip().upper()
+        key = re.sub(r"^MLS®?\s*", "", key, flags=re.I).lstrip("#").strip()
+        if not key or key in seen:
+            continue
+        if not key_re.fullmatch(key):
+            _err(errors, path, f'"{part.strip()}" does not look like an MLS® number.')
+            continue
+        seen.add(key)
+        keys.append(key)
+        if len(keys) > 50:
+            _err(errors, path, "Pin at most 50 MLS® numbers.")
+            return keys[:50]
+    return keys
+
+
 def _curated(document: dict, errors: dict) -> dict:
     """Keyword / curated listing searches edited in Studio."""
     import re
@@ -921,17 +957,25 @@ def _curated(document: dict, errors: dict) -> dict:
         if not isinstance(enabled, bool):
             enabled = True
 
-        cleaned_pages.append(
-            {
-                "slug": slug,
-                "label": _text(item.get("label"), f"{path}.label", errors, 60),
-                "h1": _text(item.get("h1"), f"{path}.h1", errors, 100),
-                "description": _text(item.get("description"), f"{path}.description", errors, 240),
-                "group": group,
-                "query": query,
-                "enabled": enabled,
-            }
+        # Pinned MLS® / listing keys — public /homes pages show these only.
+        listing_keys = _curated_listing_keys(
+            item.get("listingKeys", item.get("listing_keys")),
+            f"{path}.listingKeys",
+            errors,
         )
+
+        page_out = {
+            "slug": slug,
+            "label": _text(item.get("label"), f"{path}.label", errors, 60),
+            "h1": _text(item.get("h1"), f"{path}.h1", errors, 100),
+            "description": _text(item.get("description"), f"{path}.description", errors, 240),
+            "group": group,
+            "query": query,
+            "enabled": enabled,
+        }
+        if listing_keys:
+            page_out["listingKeys"] = listing_keys
+        cleaned_pages.append(page_out)
     return {"pages": cleaned_pages}
 
 

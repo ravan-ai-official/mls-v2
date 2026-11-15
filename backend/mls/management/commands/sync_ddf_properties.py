@@ -1,4 +1,4 @@
-import time
+﻿import time
 from datetime import timedelta
 
 from django.core.management.base import BaseCommand, CommandError

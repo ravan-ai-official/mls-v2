@@ -668,11 +668,31 @@ def _apply_map_filters_to_queryset(qs, params):
 # for almost every home, so it cannot tell a condo from a detached house;
 # structure_type + property_attached_yn can (House/unattached 2,079,
 # House/attached 214, Apartment 1,007, Row / Townhouse 662 on 2026-09-25).
+# Sub-type / style fallbacks catch rows where StructureType was blank but the
+# feed still labelled Semi-Detached or Condo Apartment explicitly.
 HOME_TYPE_Q = {
     "detached": Q(structure_type__iexact="House", property_attached_yn=False),
-    "semi": Q(structure_type__iexact="House", property_attached_yn=True),
-    "condo": Q(structure_type__iexact="Apartment"),
-    "townhouse": Q(structure_type__iexact="Row / Townhouse"),
+    "semi": (
+        Q(structure_type__iexact="House", property_attached_yn=True)
+        | Q(property_sub_type__icontains="Semi-Detached")
+        | Q(property_sub_type__icontains="Semi Detached")
+        | Q(architectural_style__icontains="Semi-Detached")
+        | Q(architectural_style__icontains="Semi Detached")
+    ),
+    "condo": (
+        Q(structure_type__iexact="Apartment")
+        | Q(structure_type__icontains="Apartment")
+        | Q(property_sub_type__icontains="Condo Apartment")
+        | Q(property_sub_type__icontains="Co-op Apartment")
+        | Q(property_sub_type__icontains="Coop Apartment")
+    ),
+    "townhouse": (
+        Q(structure_type__iexact="Row / Townhouse")
+        | Q(structure_type__icontains="Townhouse")
+        | Q(property_sub_type__icontains="Att/Row")
+        | Q(property_sub_type__icontains="Townhouse")
+        | Q(property_sub_type__icontains="Townhome")
+    ),
 }
 
 

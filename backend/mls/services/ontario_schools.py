@@ -187,7 +187,6 @@ def search_schools(
             score = 80.0
         else:
             score = 60.0
-        # Prefer GTA secondaries slightly — common buyer search intent.
         if (school.get("level") or "").lower() == "secondary":
             score += 2.0
         if _GTA["lat_min"] <= lat <= _GTA["lat_max"] and _GTA["lon_min"] <= lon <= _GTA["lon_max"]:

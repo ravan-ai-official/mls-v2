@@ -1,3 +1,5 @@
+from datetime import date
+
 from mls.models import Property
 from mls.services.ddf.converters import (
     safe_bool,
@@ -7,6 +9,14 @@ from mls.services.ddf.converters import (
     safe_list,
     safe_str,
 )
+
+
+def _year_from_approximate_age(raw) -> int | None:
+    """RESO ApproximateAge is often age-in-years; convert to a calendar year."""
+    age = safe_int(raw)
+    if age is None or age < 0 or age >= 300:
+        return None
+    return date.today().year - age
 
 
 def map_property_defaults(data):
@@ -130,7 +140,20 @@ def map_property_defaults(data):
 
         # Building measurements
         "parking_total": safe_int(data.get("ParkingTotal")),
-        "year_built": safe_int(data.get("YearBuilt")),
+        "garages": safe_int(
+            data.get("GarageSpaces")
+            if data.get("GarageSpaces") is not None
+            else data.get("CoveredSpaces")
+        ),
+        "garage_size": safe_str(data.get("GarageType"))
+        or safe_list(data.get("GarageType")),
+        "kitchens": safe_int(
+            data.get("NumberOfKitchens")
+            if data.get("NumberOfKitchens") is not None
+            else data.get("KitchensTotalInteger")
+        ),
+        "year_built": safe_int(data.get("YearBuilt"))
+        or _year_from_approximate_age(data.get("ApproximateAge")),
         "bathrooms_partial": safe_int(data.get("BathroomsPartial")),
         "bathrooms_total_integer": safe_int(
             data.get("BathroomsTotalInteger")
@@ -184,7 +207,8 @@ def map_property_defaults(data):
         "construction_materials": safe_list(
             data.get("ConstructionMaterials")
         ),
-        "stories": safe_int(data.get("Stories")),
+        "stories": safe_int(data.get("Stories"))
+        or safe_int(data.get("StoriesTotal")),
         "property_attached_yn": safe_bool(data.get("PropertyAttachedYN")),
         "accessibility_features": safe_list(
             data.get("AccessibilityFeatures")
