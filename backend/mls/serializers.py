@@ -108,6 +108,11 @@ class PropertySerializer(serializers.ModelSerializer):
             'year_built', 'public_remarks', 'listing_url', 'category_type',"state_or_province","lease_amount",
             # Most DDF rentals carry their monthly rent here, not in lease_amount.
             "total_actual_rent",
+            # Sqft: exact LivingArea, else the DDF min/max band, else above-grade.
+            "living_area",
+            "living_area_minimum",
+            "living_area_maximum",
+            "above_grade_finished_area",
             'latitude', 'longitude', 'photos_count', 'standard_status',
             'media',
             'close_price', 'close_date',

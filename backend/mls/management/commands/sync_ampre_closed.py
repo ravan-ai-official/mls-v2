@@ -32,13 +32,35 @@ SELECT_FIELDS = [
     "ListPrice",
     "ClosePrice",
     "CloseDate",
+    "PreviousListPrice",
+    "PriceChangeTimestamp",
     "UnparsedAddress",
     "City",
+    "CityRegion",
     "StateOrProvince",
     "PostalCode",
     "PropertySubType",
+    "StructureType",
+    "PropertyAttachedYN",
     "BedroomsTotal",
+    "BedroomsAboveGrade",
+    "BedroomsBelowGrade",
     "BathroomsTotalInteger",
+    "LivingArea",
+    "LivingAreaMinimum",
+    "LivingAreaMaximum",
+    "AboveGradeFinishedArea",
+    "BuildingAreaTotal",
+    "YearBuilt",
+    "ApproximateAge",
+    "TaxAnnualAmount",
+    "AssociationFee",
+    "AssociationFeeFrequency",
+    "AssociationFeeIncludes",
+    "ParkingTotal",
+    "ParkingFeatures",
+    "BuildingFeatures",
+    "CommonInterest",
     "Latitude",
     "Longitude",
     "PublicRemarks",
@@ -83,28 +105,14 @@ def _date(value):
 
 
 def map_ampre_inactive(row: dict) -> dict:
-    status = (row.get("StandardStatus") or "").strip() or "Closed"
-    return {
-        "category_type": Property.DDF,
-        "listing_id": (row.get("ListingId") or row.get("ListingKey") or "")[:50] or None,
-        "standard_status": status[:50],
-        "list_price": _dec(row.get("ListPrice")),
-        "close_price": _dec(row.get("ClosePrice")),
-        "close_date": _date(row.get("CloseDate")),
-        "unparsed_address": (row.get("UnparsedAddress") or "")[:2000] or None,
-        "city": (row.get("City") or "")[:2000] or None,
-        "state_or_province": (row.get("StateOrProvince") or "Ontario")[:100] or None,
-        "postal_code": (row.get("PostalCode") or "")[:20] or None,
-        "property_sub_type": (row.get("PropertySubType") or "")[:100] or None,
-        "bedrooms_total": _int(row.get("BedroomsTotal")),
-        "bathrooms_total_integer": _int(row.get("BathroomsTotalInteger")),
-        "latitude": _dec(row.get("Latitude")),
-        "longitude": _dec(row.get("Longitude")),
-        "public_remarks": row.get("PublicRemarks") or "",
-        "original_entry_timestamp": _dt(row.get("OriginalEntryTimestamp")),
-        "modification_timestamp": _dt(row.get("ModificationTimestamp")) or timezone.now(),
-        "status_change_timestamp": _dt(row.get("ModificationTimestamp")) or timezone.now(),
-    }
+    """Reuse the shared AMPRE field map so closed/terminated rows stay rich."""
+    from mls.services.listing_refresh import map_ampre_row
+
+    mapped = map_ampre_row(row)
+    status = (mapped.get("standard_status") or "Closed").strip() or "Closed"
+    mapped["standard_status"] = status[:50]
+    mapped["category_type"] = Property.DDF
+    return mapped
 
 
 class Command(BaseCommand):
@@ -154,7 +162,8 @@ class Command(BaseCommand):
                     "De-listed",
                     f"({city_filter}) and ("
                     "StandardStatus eq 'Expired' or StandardStatus eq 'Canceled' "
-                    "or StandardStatus eq 'Cancelled' or StandardStatus eq 'Withdrawn'"
+                    "or StandardStatus eq 'Cancelled' or StandardStatus eq 'Withdrawn' "
+                    "or StandardStatus eq 'Terminated'"
                     f") and {RESIDENTIAL_CLAUSE} "
                     f"and ModificationTimestamp ge {start}T00:00:00Z",
                     "ModificationTimestamp desc",

@@ -218,6 +218,7 @@ class Command(BaseCommand):
         self.initialize_small_cache()
 
         if not options["priority_cache"]:
+            self.expire_ghost_actives(retention_days)
             self.prune_expired_properties(
                 retention_days
             )
@@ -329,6 +330,7 @@ class Command(BaseCommand):
             )
 
         if not options["priority_cache"]:
+            self.expire_ghost_actives(retention_days)
             self.prune_expired_properties(
                 retention_days
             )
@@ -734,6 +736,34 @@ class Command(BaseCommand):
             f"(cap: {max_storage_mb} MB)."
         )
 
+    def expire_ghost_actives(self, retention_days):
+        """
+        Mark Active DDF rows that have not been refreshed as Expired.
+
+        CREA DDF never pushes Terminated/Expired — the listing simply
+        disappears. Without this step, those rows keep showing "For Sale"
+        at a stale price (the HouseSigma mismatch we saw on C14096360).
+        """
+        # Give incremental sync a little room past the retention window.
+        cutoff = timezone.now() - timedelta(days=max(int(retention_days), 1))
+        stale = (
+            Property.objects.filter(category_type=Property.DDF)
+            .filter(standard_status__iexact="Active")
+            .filter(
+                Q(modification_timestamp__lt=cutoff)
+                | Q(modification_timestamp__isnull=True)
+            )
+        )
+        count = stale.update(
+            standard_status="Expired",
+            status_change_timestamp=timezone.now(),
+        )
+        if count:
+            self.stdout.write(
+                f"Marked {count:,} stale Active DDF listings as Expired "
+                f"(not seen in feed for {retention_days}+ days)."
+            )
+
     def prune_expired_properties(
         self,
         retention_days,
@@ -1009,6 +1039,19 @@ class Command(BaseCommand):
                         "modification_timestamp"
                     )
                 )
+
+                # Track list-price cuts so the UI Price Drop badge and
+                # HouseSigma-style history stay honest after sync.
+                if (
+                    old_price is not None
+                    and new_price is not None
+                    and old_price != new_price
+                ):
+                    defaults["previous_list_price"] = old_price
+                    defaults["price_change_timestamp"] = (
+                        new_modification_timestamp
+                        or timezone.now()
+                    )
 
                 snapshot_changed = (
                     old_price != new_price

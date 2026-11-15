@@ -19,6 +19,24 @@ def _year_from_approximate_age(raw) -> int | None:
     return date.today().year - age
 
 
+def _living_area_fields(data) -> dict:
+    """Map LivingArea plus the min/max band DDF uses when exact sqft is absent."""
+    living = safe_decimal(data.get("LivingArea"))
+    living_min = safe_decimal(data.get("LivingAreaMinimum"))
+    living_max = safe_decimal(data.get("LivingAreaMaximum"))
+    if living is None and living_min is not None:
+        living = living_min
+    elif living is None and living_max is not None:
+        living = living_max
+    return {
+        "living_area": living,
+        "living_area_units": safe_str(data.get("LivingAreaUnits")),
+        "living_area_source": safe_str(data.get("LivingAreaSource")),
+        "living_area_minimum": living_min,
+        "living_area_maximum": living_max,
+    }
+
+
 def map_property_defaults(data):
     """
     Convert one raw DDF property dictionary into values understood
@@ -153,7 +171,8 @@ def map_property_defaults(data):
             else data.get("KitchensTotalInteger")
         ),
         "year_built": safe_int(data.get("YearBuilt"))
-        or _year_from_approximate_age(data.get("ApproximateAge")),
+        or _year_from_approximate_age(data.get("ApproximateAge"))
+        or _year_from_approximate_age(data.get("PropertyAge")),
         "bathrooms_partial": safe_int(data.get("BathroomsPartial")),
         "bathrooms_total_integer": safe_int(
             data.get("BathroomsTotalInteger")
@@ -184,9 +203,10 @@ def map_property_defaults(data):
         "below_grade_finished_area_source": safe_str(
             data.get("BelowGradeFinishedAreaSource")
         ),
-        "living_area": safe_decimal(data.get("LivingArea")),
-        "living_area_units": safe_str(data.get("LivingAreaUnits")),
-        "living_area_source": safe_str(data.get("LivingAreaSource")),
+        # TRREB/DDF often leave LivingArea null and only fill the min/max
+        # band (e.g. 800–899). Persist the band and use the floor as the
+        # displayable living_area so cards/Key Facts are not blank.
+        **_living_area_fields(data),
 
         # Interior and construction
         "fireplaces_total": safe_int(data.get("FireplacesTotal")),

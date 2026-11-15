@@ -206,6 +206,26 @@ if os.environ.get("SOLD_TRENDS_WARM_BEAT_ENABLED", "0") == "1":
         "warm-sold-trends": {"task": "mls.tasks.warm_sold_trends_cache", "schedule": crontab(minute=5, hour="*/4")},
     }
 
+# DDF rolling cache + AMPRE off-market sync. Required for HouseSigma-parity
+# status/price: without these, Active rows go stale and Terminated never lands.
+if os.environ.get("DDF_SYNC_BEAT_ENABLED", "0") == "1":
+    CELERY_BEAT_SCHEDULE = {
+        **globals().get("CELERY_BEAT_SCHEDULE", {}),
+        "sync-ddf-listing-cache": {
+            "task": "mls.tasks.sync_ddf_listing_cache",
+            "schedule": crontab(minute="*/30"),
+        },
+    }
+
+if os.environ.get("AMPRE_CLOSED_BEAT_ENABLED", "0") == "1":
+    CELERY_BEAT_SCHEDULE = {
+        **globals().get("CELERY_BEAT_SCHEDULE", {}),
+        "sync-ampre-inactive-listings": {
+            "task": "mls.tasks.sync_ampre_inactive_listings",
+            "schedule": crontab(minute=20, hour="*/6"),
+        },
+    }
+
 CACHE_URL = os.environ.get("CACHE_URL", os.environ.get("REDIS_URL", "")).strip()
 if CACHE_URL:
     CACHES = {

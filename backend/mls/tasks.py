@@ -20,3 +20,21 @@ def run_saved_search_alerts() -> dict:
     from mls.services.saved_search_alerts import send_saved_search_alerts
 
     return send_saved_search_alerts()
+
+
+@shared_task
+def sync_ddf_listing_cache() -> dict:
+    """Incremental DDF sync + expire ghost Actives. Enable via DDF_SYNC_BEAT_ENABLED=1."""
+    from django.core.management import call_command
+
+    call_command("sync_ddf_properties")
+    return {"ok": True}
+
+
+@shared_task
+def sync_ampre_inactive_listings() -> dict:
+    """Pull Terminated/Expired/Closed from AMPRE. Enable via AMPRE_CLOSED_BEAT_ENABLED=1."""
+    from django.core.management import call_command
+
+    call_command("sync_ampre_closed")
+    return {"ok": True}

@@ -1928,6 +1928,22 @@ class PropertyDetailView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        # Keep detail pages honest even when Celery/DDF sync is behind:
+        # stale Active rows are re-checked against AMPRE (status/price/sqft).
+        try:
+            from mls.services.listing_refresh import maybe_refresh_stale_listing
+
+            property_obj = maybe_refresh_stale_listing(property_obj)
+            property_obj = (
+                Property.objects
+                .prefetch_related("media", "rooms")
+                .filter(pk=property_obj.pk)
+                .first()
+                or property_obj
+            )
+        except Exception:
+            pass
+
         serializer = PropertyDetailSerializer(
             property_obj,
             context={"request": request},
