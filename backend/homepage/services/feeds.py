@@ -77,6 +77,34 @@ def _local_by_mls(mls_numbers: Iterable[str]) -> dict[str, str]:
     )
 
 
+def _ampre_primary_photos(mls_numbers: Iterable[str]) -> dict[str, str]:
+    """Preferred/first AMPRE MediaURL per TRREB MLS / ListingKey.
+
+    Price-drop deals come from AMPRE and often are not in the local DDF
+    catalogue yet, so ``_photos`` has nothing to join. Hitting Media for the
+    handful of ranked deals (typically ≤4) keeps the cards from rendering
+    blank while the listing sync catches up.
+    """
+    from mls.services.ampre_media import fetch_ampre_photos_for_listing_id
+
+    out: dict[str, str] = {}
+    for mls in mls_numbers:
+        key = (mls or "").strip()
+        if not key or key in out:
+            continue
+        try:
+            photos = fetch_ampre_photos_for_listing_id(key)
+        except AmpreClientError as exc:
+            logger.warning("AMPRE media miss for deal %s: %s", key, exc)
+            continue
+        if not photos:
+            continue
+        url = (photos[0].get("MediaURL") or "").strip()
+        if url:
+            out[key] = url
+    return out
+
+
 # --------------------------------------------------------------------------
 # High return properties
 # --------------------------------------------------------------------------
@@ -157,10 +185,17 @@ def market_deals(limit: int = 4) -> dict[str, Any]:
         deals = rank_price_drops(rows, limit)
         local = _local_by_mls(d.mls_number for d in deals)
         photos = _photos(local.values())
+        need_ampre = [
+            d.mls_number
+            for d in deals
+            if not photos.get(local.get(d.mls_number) or "")
+        ]
+        ampre_photos = _ampre_primary_photos(need_ampre) if need_ampre else {}
         results = []
         for deal in deals:
             key = local.get(deal.mls_number)
-            results.append({**deal.as_dict(), "listing_key": key, "image_url": photos.get(key) if key else None})
+            image = (photos.get(key) if key else None) or ampre_photos.get(deal.mls_number)
+            results.append({**deal.as_dict(), "listing_key": key, "image_url": image})
         return {"results": results, "generated_at": timezone.now().isoformat()}
 
     return _cached(f"home:deals:{limit}", DEALS_TTL, build)
