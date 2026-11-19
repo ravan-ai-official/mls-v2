@@ -124,9 +124,18 @@ class MarketDealsView(PublicView):
 
 class SoldBelowPurchaseView(PublicView):
     def get(self, request):
+        from mls.services.visitor_place import cities_for_request
+
         limit = _int_param(request, "limit", 3, 1, 12)
+        cities = cities_for_request(request)
         city = (request.query_params.get("city") or "").strip() or None
-        return Response(feeds.sold_below_purchase(limit=limit, city=city))
+        return Response(
+            feeds.sold_below_purchase(
+                limit=limit,
+                city=city,
+                cities=cities or None,
+            )
+        )
 
 
 class MarketSnapshotView(PublicView):

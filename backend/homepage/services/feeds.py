@@ -268,35 +268,212 @@ def market_deals(limit: int = 4) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# Sold below last purchase (reads the table the nightly job fills)
+# Sold below last purchase (table first; local/AMPRE fill when empty)
 # --------------------------------------------------------------------------
 
 
-def sold_below_purchase(limit: int = 3, city: str | None = None) -> dict[str, Any]:
+def _sold_below_row(
+    *,
+    listing_key: str,
+    address: str,
+    city: str,
+    property_sub_type: str | None,
+    bedrooms: int | None,
+    bathrooms: int | None,
+    close_price: float,
+    close_date: str,
+    previous_close_price: float,
+    previous_close_date: str,
+    loss_amount: float,
+    image_url: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "listing_key": listing_key,
+        "address": address,
+        "city": city,
+        "property_sub_type": property_sub_type or "",
+        "bedrooms": bedrooms,
+        "bathrooms": bathrooms,
+        "close_price": close_price,
+        "close_date": close_date,
+        "previous_close_price": previous_close_price,
+        "previous_close_date": previous_close_date,
+        "loss_amount": loss_amount,
+        "image_url": image_url,
+    }
+
+
+def _sold_below_from_table(limit: int, cities: list[str] | None) -> tuple[list[dict[str, Any]], str | None]:
     from homepage.models import SoldBelowPurchase
 
     qs = SoldBelowPurchase.objects.all()
-    if city:
-        qs = qs.filter(city__iexact=city)
+    if cities:
+        city_q = Q()
+        for city in cities:
+            city_q |= Q(city__iexact=city) | Q(city__istartswith=city)
+        qs = qs.filter(city_q)
     rows = list(qs.order_by("-close_date")[:limit])
-    return {
-        "results": [
-            {
-                "listing_key": row.listing_key,
-                "address": row.address,
-                "city": row.city,
-                "property_sub_type": row.property_sub_type,
-                "bedrooms": row.bedrooms,
-                "bathrooms": row.bathrooms,
-                "close_price": float(row.close_price),
-                "close_date": row.close_date.isoformat(),
-                "previous_close_price": float(row.previous_close_price),
-                "previous_close_date": row.previous_close_date.isoformat(),
-                "loss_amount": float(row.loss_amount),
-            }
+    photos = _photos(row.listing_key for row in rows)
+    return (
+        [
+            _sold_below_row(
+                listing_key=row.listing_key,
+                address=row.address,
+                city=row.city,
+                property_sub_type=row.property_sub_type,
+                bedrooms=row.bedrooms,
+                bathrooms=row.bathrooms,
+                close_price=float(row.close_price),
+                close_date=row.close_date.isoformat(),
+                previous_close_price=float(row.previous_close_price),
+                previous_close_date=row.previous_close_date.isoformat(),
+                loss_amount=float(row.loss_amount),
+                image_url=photos.get(row.listing_key),
+            )
             for row in rows
         ],
-        "computed_at": rows[0].computed_at.isoformat() if rows else None,
+        rows[0].computed_at.isoformat() if rows else None,
+    )
+
+
+def _sold_below_from_local(limit: int, cities: list[str] | None) -> list[dict[str, Any]]:
+    """Repeat-sale losses from Closed rows already in the catalogue."""
+    from homepage.services.sold_below import find_repeat_sale_losses
+
+    qs = Property.objects.filter(
+        standard_status__iexact="Closed",
+        close_price__gt=0,
+        close_date__isnull=False,
+        unparsed_address__isnull=False,
+    ).exclude(unparsed_address="")
+    if cities:
+        city_q = Q()
+        for city in cities:
+            city_q |= Q(city__istartswith=city)
+        qs = qs.filter(city_q)
+    raw = [
+        {
+            "ListingKey": row["listing_key"],
+            "UnparsedAddress": row["unparsed_address"],
+            "City": row["city"] or "",
+            "PropertySubType": row["property_sub_type"] or "",
+            "BedroomsTotal": row["bedrooms_total"],
+            "BathroomsTotalInteger": row["bathrooms_total_integer"],
+            "ClosePrice": float(row["close_price"]),
+            "CloseDate": row["close_date"].isoformat(),
+        }
+        for row in qs.order_by("-close_date").values(
+            "listing_key",
+            "unparsed_address",
+            "city",
+            "property_sub_type",
+            "bedrooms_total",
+            "bathrooms_total_integer",
+            "close_price",
+            "close_date",
+        )[:12_000]
+    ]
+    losses = find_repeat_sale_losses(raw)[:limit]
+    photos = _photos(loss.listing_key for loss in losses)
+    return [
+        _sold_below_row(
+            listing_key=loss.listing_key,
+            address=loss.address,
+            city=loss.city,
+            property_sub_type=loss.property_sub_type,
+            bedrooms=loss.bedrooms,
+            bathrooms=loss.bathrooms,
+            close_price=loss.close_price,
+            close_date=loss.close_date.isoformat(),
+            previous_close_price=loss.previous_close_price,
+            previous_close_date=loss.previous_close_date.isoformat(),
+            loss_amount=loss.previous_close_price - loss.close_price,
+            image_url=photos.get(loss.listing_key),
+        )
+        for loss in losses
+    ]
+
+
+def _sold_below_from_ampre(limit: int, cities: list[str] | None) -> list[dict[str, Any]]:
+    """One-city AMPRE pull when the table and local catalogue have no pairs."""
+    from homepage.services.sold_below import find_repeat_sale_losses
+
+    targets = cities[:2] if cities else list(GTA_CITIES[:3])
+    cache_key = f"home:sold-below:live:{','.join(c.lower() for c in targets)}:{limit}"
+
+    def build() -> list[dict[str, Any]]:
+        raw: list[dict[str, Any]] = []
+        for city in targets:
+            try:
+                raw.extend(ampre.fetch_closed_sales(city, days=730, max_rows=8_000))
+            except AmpreClientError as exc:
+                logger.warning("Sold-below live AMPRE miss for %s: %s", city, exc)
+        losses = find_repeat_sale_losses(raw)[:limit]
+        photos = _photos(loss.listing_key for loss in losses)
+        return [
+            _sold_below_row(
+                listing_key=loss.listing_key,
+                address=loss.address,
+                city=loss.city,
+                property_sub_type=loss.property_sub_type,
+                bedrooms=loss.bedrooms,
+                bathrooms=loss.bathrooms,
+                close_price=loss.close_price,
+                close_date=loss.close_date.isoformat(),
+                previous_close_price=loss.previous_close_price,
+                previous_close_date=loss.previous_close_date.isoformat(),
+                loss_amount=loss.previous_close_price - loss.close_price,
+                image_url=photos.get(loss.listing_key),
+            )
+            for loss in losses
+        ]
+
+    return _cached(cache_key, 60 * 60, build)
+
+
+def sold_below_purchase(
+    limit: int = 3,
+    city: str | None = None,
+    cities: list[str] | None = None,
+) -> dict[str, Any]:
+    preferred = [c for c in (cities or ([city] if city else [])) if c]
+    rows, computed_at = _sold_below_from_table(limit, preferred or None)
+    source = "table"
+    if len(rows) < limit:
+        local = _sold_below_from_local(limit, preferred or None)
+        if local:
+            seen = {row["listing_key"] for row in rows}
+            for row in local:
+                if row["listing_key"] in seen:
+                    continue
+                rows.append(row)
+                seen.add(row["listing_key"])
+                if len(rows) >= limit:
+                    break
+            source = "table+local" if computed_at else "local"
+            computed_at = computed_at or timezone.now().isoformat()
+    if len(rows) < max(1, limit // 2):
+        try:
+            live = _sold_below_from_ampre(limit, preferred or None)
+        except Exception as exc:  # noqa: BLE001 — feed must degrade, not 500
+            logger.warning("Sold-below AMPRE fill failed: %s", exc)
+            live = []
+        if live:
+            seen = {row["listing_key"] for row in rows}
+            for row in live:
+                if row["listing_key"] in seen:
+                    continue
+                rows.append(row)
+                seen.add(row["listing_key"])
+                if len(rows) >= limit:
+                    break
+            source = f"{source}+ampre" if rows else "ampre"
+            computed_at = computed_at or timezone.now().isoformat()
+    return {
+        "results": rows[:limit],
+        "computed_at": computed_at,
+        "source": source,
+        "cities": preferred,
     }
 
 
