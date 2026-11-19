@@ -167,6 +167,18 @@ class NearbyActivityView(PublicView):
         return Response({"results": [item.__dict__ for item in results], "radius_km": radius})
 
 
+class NeighbourActivityView(PublicView):
+    """Mixed Just Listed / Price Drop / Open House / Sold cards for the
+    homepage neighbour-alerts preview. Prefers visitor cities."""
+
+    def get(self, request):
+        from mls.services.visitor_place import cities_for_request
+
+        limit = _int_param(request, "limit", 4, 1, 12)
+        cities = cities_for_request(request)
+        return Response(feeds.neighbour_activity(limit=limit, cities=cities or None))
+
+
 # --------------------------------------------------------------------------
 # Subscriptions
 # --------------------------------------------------------------------------

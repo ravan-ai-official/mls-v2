@@ -16,6 +16,7 @@ urlpatterns = [
     path("sold-below-purchase/", views.SoldBelowPurchaseView.as_view(), name="sold-below-purchase"),
     path("market-snapshot/", views.MarketSnapshotView.as_view(), name="market-snapshot"),
     path("nearby-activity/", views.NearbyActivityView.as_view(), name="nearby-activity"),
+    path("neighbour-activity/", views.NeighbourActivityView.as_view(), name="neighbour-activity"),
     # Subscriptions
     path("newsletter/subscribe/", views.NewsletterSubscribeView.as_view(), name="newsletter-subscribe"),
     path("nearby-alerts/", views.NearbyAlertListCreateView.as_view(), name="nearby-alerts"),

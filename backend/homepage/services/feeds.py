@@ -11,7 +11,7 @@ import logging
 from typing import Any, Iterable
 
 from django.core.cache import cache
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from mls.models import Media, Property
@@ -511,3 +511,169 @@ def market_snapshot(scope: str = "gta") -> dict[str, Any]:
             raise FeedUnavailable(str(exc)) from exc
     age = (timezone.now() - snapshot.as_of).total_seconds()
     return {**snapshot.payload, "scope": scope, "as_of": snapshot.as_of.isoformat(), "stale": age > SNAPSHOT_MAX_AGE}
+
+# --------------------------------------------------------------------------
+# Neighbour activity preview (Just Listed / Price Drop / Open House / Sold)
+# --------------------------------------------------------------------------
+
+
+def neighbour_activity(limit: int = 4, cities: list[str] | None = None) -> dict[str, Any]:
+    """Mixed recent activity for the homepage neighbour-alerts panel.
+
+    Prefers visitor cities when provided; otherwise the wider GTA catalogue.
+    One card per event type when possible, then filled with newest listings so
+    the rail stays full. City-scoped misses fall back to GTA so personalization
+    never blanks the preview.
+    """
+    from mls.models import OpenHouse
+
+    preferred = [c for c in (cities or []) if c]
+    city_q = Q()
+    for city in preferred:
+        city_q |= Q(city__istartswith=city)
+    scope_q = city_q if preferred else _gta_q()
+
+    today = timezone.now().date()
+    picked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(event: str, prop: dict[str, Any], *, occurred_at, price: float | None) -> None:
+        key = prop.get("listing_key") or ""
+        if not key or key in seen or len(picked) >= limit:
+            return
+        seen.add(key)
+        picked.append(
+            {
+                "listing_key": key,
+                "event": event,
+                "address": (prop.get("unparsed_address") or "").split(",")[0].strip() or key,
+                "city": base_city(prop.get("city") or ""),
+                "list_price": price,
+                "occurred_at": occurred_at.isoformat()
+                if hasattr(occurred_at, "isoformat")
+                else occurred_at,
+                "image_url": None,
+            }
+        )
+
+    def first_row(base_qs, order, values):
+        scoped = base_qs.filter(scope_q).order_by(order)
+        row = scoped.values(*values).first()
+        if row or not preferred:
+            return row, scoped
+        wide = base_qs.filter(_gta_q()).order_by(order)
+        return wide.values(*values).first(), wide
+
+    listed_base = Property.objects.filter(
+        standard_status__iexact="Active",
+        list_price__gt=0,
+        original_entry_timestamp__isnull=False,
+    )
+    listed, listed_qs = first_row(
+        listed_base,
+        "-original_entry_timestamp",
+        ("listing_key", "unparsed_address", "city", "list_price", "original_entry_timestamp"),
+    )
+    if listed:
+        add(
+            "Just Listed",
+            listed,
+            occurred_at=listed["original_entry_timestamp"],
+            price=to_float(listed["list_price"]),
+        )
+
+    drop_base = Property.objects.filter(
+        standard_status__iexact="Active",
+        list_price__gt=0,
+        previous_list_price__gt=0,
+        price_change_timestamp__isnull=False,
+        list_price__lt=F("previous_list_price"),
+    )
+    drop, _ = first_row(
+        drop_base,
+        "-price_change_timestamp",
+        (
+            "listing_key",
+            "unparsed_address",
+            "city",
+            "list_price",
+            "previous_list_price",
+            "price_change_timestamp",
+        ),
+    )
+    if drop:
+        add(
+            "Price Drop",
+            drop,
+            occurred_at=drop["price_change_timestamp"],
+            price=to_float(drop["list_price"]),
+        )
+
+    oh_base = OpenHouse.objects.filter(
+        date__gte=today,
+        property__standard_status__iexact="Active",
+        property__list_price__gt=0,
+    )
+    oh_scope = Q()
+    cities_for_oh = preferred or list(GTA_CITIES)
+    for city in cities_for_oh:
+        oh_scope |= Q(property__city__istartswith=city)
+    open_house = (
+        oh_base.filter(oh_scope).select_related("property").order_by("date", "start_time").first()
+    )
+    if open_house is None and preferred:
+        gta_oh = Q()
+        for city in GTA_CITIES:
+            gta_oh |= Q(property__city__istartswith=city)
+        open_house = (
+            oh_base.filter(gta_oh).select_related("property").order_by("date", "start_time").first()
+        )
+    if open_house and open_house.property_id:
+        prop = open_house.property
+        add(
+            "Open House",
+            {
+                "listing_key": prop.listing_key,
+                "unparsed_address": prop.unparsed_address,
+                "city": prop.city,
+            },
+            occurred_at=open_house.date,
+            price=to_float(prop.list_price),
+        )
+
+    sold_base = Property.objects.filter(
+        standard_status__iexact="Closed",
+        close_price__gt=0,
+        close_date__isnull=False,
+    )
+    sold, _ = first_row(
+        sold_base,
+        "-close_date",
+        ("listing_key", "unparsed_address", "city", "close_price", "close_date"),
+    )
+    if sold:
+        add(
+            "Just Sold",
+            sold,
+            occurred_at=sold["close_date"],
+            price=to_float(sold["close_price"]),
+        )
+
+    if len(picked) < limit:
+        for row in listed_qs.values(
+            "listing_key", "unparsed_address", "city", "list_price", "original_entry_timestamp"
+        )[: limit * 4]:
+            add(
+                "Just Listed",
+                row,
+                occurred_at=row["original_entry_timestamp"],
+                price=to_float(row["list_price"]),
+            )
+            if len(picked) >= limit:
+                break
+
+    photos = _photos(item["listing_key"] for item in picked)
+    for item in picked:
+        item["image_url"] = photos.get(item["listing_key"])
+
+    return {"results": picked[:limit], "cities": preferred}
