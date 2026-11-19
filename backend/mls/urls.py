@@ -15,6 +15,7 @@ from .views_activity import PreconActivityAPIView, StudioActivityAPIView
 from .views_push import PushSubscribeAPIView, PushVapidAPIView
 from .views_properties import PropertyFilterView
 from .views_schools import SchoolsNearAPIView, SchoolsSearchAPIView, TopSchoolsAPIView
+from .views_climate import ClimateRiskAPIView
 from .views_sitemap import SitemapListingKeysView
 from .views_market import (
     CatalogStatsBulkAPIView,
@@ -147,6 +148,7 @@ urlpatterns = [
     path('schools/near/', SchoolsNearAPIView.as_view(), name='schools-near'),
     path('schools/top/', TopSchoolsAPIView.as_view(), name='schools-top'),
     path('schools/search/', SchoolsSearchAPIView.as_view(), name='schools-search'),
+    path('climate-risk/', ClimateRiskAPIView.as_view(), name='climate-risk'),
     path('nearest-school/', NearestSchoolAPIView.as_view(), name='nearest-school'),
     path('nearby-amenities/', NearbyAmenitiesAPIView.as_view(), name='nearby-amenities'),
     path('listing-sync-status/', ListingSyncStatusAPIView.as_view(), name='listing-sync-status'),
