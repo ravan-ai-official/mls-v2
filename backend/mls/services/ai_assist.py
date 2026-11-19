@@ -1,21 +1,26 @@
 """On-site assistant (scope #25).
 
-Answers are limited to a snapshot of this site: a few active listings in a
-named city, published pre-construction projects, approved assignments, and
-the public pages the site actually has. The model cannot be given the open
-web, and every link it returns is checked against that page list.
+Answers are limited to a snapshot of this site: active listings matching the
+visitor's city / beds / type when asked, published pre-construction projects,
+approved assignments, and the public pages the site actually has. The model
+cannot use the open web, and every link it returns is checked against that
+page list.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
+
+from django.db.models import Q
 
 from mls.models import Content, ListingSubmission, PreComProperty, Property
 from mls.services.openai_client import OpenAIError, chat, is_configured, search_model
+from mls.services.query_helpers import city_match_q
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +35,15 @@ CITIES = (
     "Oakville",
     "Burlington",
     "Hamilton",
+    "Richmond Hill",
+    "Pickering",
+    "Ajax",
+    "Whitby",
+    "Oshawa",
+    "Milton",
+    "Newmarket",
 )
 
-# Paths the assistant may link to. Anything else is dropped.
 ALLOWED_PREFIXES = (
     "/listings",
     "/property",
@@ -46,6 +57,8 @@ ALLOWED_PREFIXES = (
     "/communities",
     "/watched",
     "/recently-sold",
+    "/contact",
+    "/schools",
 )
 
 PAGES = [
@@ -58,6 +71,7 @@ PAGES = [
     {"label": "List a property", "href": "/sell", "about": "Start a listing or upload an assignment."},
     {"label": "Blog", "href": "/blog", "about": "Guides and market articles."},
     {"label": "Communities", "href": "/communities", "about": "City-by-city listing snapshots."},
+    {"label": "Contact", "href": "/contact", "about": "Talk to a HomeAtlas agent."},
     {"label": "Saved homes", "href": "/watched", "about": "Favourites, notes and email alerts. Sign-in required."},
 ]
 
@@ -88,10 +102,15 @@ SCHEMA = {
 SYSTEM = (
     "You are the HomeAtlas site assistant for Greater Toronto Area real estate. "
     "Answer ONLY from the JSON context you are given. Do not invent prices, "
-    "addresses, school ratings or legal advice. If the context does not contain "
-    "the answer, say so in one sentence and point to the closest page. "
-    "links must use href values from the pages list or from a listing, project "
-    "or assignment href in the context. At most 3 links. "
+    "addresses, school ratings or legal advice. "
+    "When the visitor asks for homes (beds, condo, city, rent/sale), lead with "
+    "the suggested_search link and mention matching sample listings if present. "
+    "When they ask for pre-construction, assignments or market trends, use those "
+    "context blocks and the matching page links. "
+    "If the context does not contain the answer, say so in one sentence and point "
+    "to the closest page. "
+    "links must use href values from pages, suggested_search, or listing/project/"
+    "assignment hrefs in the context. At most 3 links. "
     "Set handoff to whatsapp when the person wants to talk to a person now, "
     "contact when they want an agent to follow up, otherwise none. "
     "Keep the answer under 120 words."
@@ -121,10 +140,83 @@ class AssistResult:
 
 def _city_in(question: str) -> str | None:
     lowered = question.lower()
-    for city in CITIES:
+    # Longer names first so "Richmond Hill" wins over a partial.
+    for city in sorted(CITIES, key=len, reverse=True):
         if city.lower() in lowered:
             return city
     return None
+
+
+def _parse_intent(question: str) -> dict:
+    text = question.lower()
+    city = _city_in(question)
+    beds = None
+    match = re.search(r"(\d+)\s*(?:\+)?\s*(?:bed|br|bedroom)s?\b", text)
+    if match:
+        beds = int(match.group(1))
+
+    home_type = None
+    if any(token in text for token in ("condo", "apartment", "flat")):
+        home_type = "Condo"
+    elif any(token in text for token in ("townhome", "townhouse", "town house", "town-home")):
+        home_type = "Townhome"
+    elif "semi" in text:
+        home_type = "Semi-Detached"
+    elif any(token in text for token in ("detached", "house", "home")):
+        # "home" alone is too broad; only treat as detached when paired with buy/sale cues.
+        if "detached" in text or "house" in text:
+            home_type = "Detached"
+
+    rent = any(token in text for token in ("rent", "rental", "lease", "for lease"))
+    wants_listings = any(
+        token in text
+        for token in (
+            "listing",
+            "listings",
+            "condo",
+            "house",
+            "town",
+            "bed",
+            "buy",
+            "sale",
+            "rent",
+            "lease",
+            "home",
+            "property",
+            "properties",
+        )
+    ) or beds is not None or home_type is not None
+    wants_precon = any(
+        token in text for token in ("pre-con", "precon", "pre construction", "pre-construction", "new build", "developer", "floor plan")
+    )
+    wants_assignments = "assignment" in text
+    wants_market = any(token in text for token in ("market", "trend", "sold data", "days on market", "sale-to-list"))
+
+    return {
+        "city": city,
+        "beds": beds,
+        "home_type": home_type,
+        "rent": rent,
+        "wants_listings": wants_listings,
+        "wants_precon": wants_precon,
+        "wants_assignments": wants_assignments,
+        "wants_market": wants_market,
+    }
+
+
+def _listings_search_href(intent: dict) -> str:
+    params: dict[str, str] = {}
+    if intent.get("rent"):
+        params["tx"] = "rent"
+    else:
+        params["status"] = "Active"
+    if intent.get("city"):
+        params["city"] = intent["city"]
+    if intent.get("beds"):
+        params["beds"] = str(intent["beds"])
+    if intent.get("home_type"):
+        params["type"] = intent["home_type"]
+    return f"/listings?{urlencode(params)}" if params else "/listings"
 
 
 def _safe_href(href: str) -> str | None:
@@ -156,104 +248,232 @@ def _clean_links(links) -> list[dict]:
     return cleaned
 
 
+def _home_type_q(home_type: str | None) -> Q | None:
+    if not home_type:
+        return None
+    token = home_type.lower()
+    if token == "condo":
+        return (
+            Q(structure_type__icontains="apartment")
+            | Q(property_sub_type__icontains="condo")
+            | Q(property_sub_type__icontains="co-op")
+            | Q(property_sub_type__icontains="apartment")
+        )
+    if token == "townhome":
+        return (
+            Q(structure_type__istartswith="row")
+            | Q(property_sub_type__icontains="town")
+            | Q(property_sub_type__icontains="att/row")
+        )
+    if token == "semi-detached":
+        return Q(property_sub_type__icontains="semi") | Q(property_attached_yn=True, structure_type__iexact="House")
+    if token == "detached":
+        return Q(property_sub_type__icontains="detached") | Q(
+            structure_type__iexact="House",
+            property_attached_yn=False,
+        )
+    return None
+
+
 def site_context(question: str) -> dict:
     """A small, real snapshot. Failures become empty lists, never invented rows."""
-    context: dict = {"pages": PAGES}
-    city = _city_in(question)
-    if city:
+    intent = _parse_intent(question)
+    context: dict = {
+        "pages": PAGES,
+        "intent": {
+            "city": intent["city"],
+            "beds": intent["beds"],
+            "home_type": intent["home_type"],
+            "rent": intent["rent"],
+        },
+    }
+
+    search_href = _listings_search_href(intent)
+    if intent["wants_listings"] or intent["city"]:
+        context["suggested_search"] = {
+            "label": "See matching listings",
+            "href": search_href,
+            "note": "Open this page for the full filtered MLS results.",
+        }
+
+    if intent["wants_listings"] or intent["city"]:
         try:
-            qs = Property.objects.filter(standard_status__iexact="Active", city__iexact=city)
+            qs = Property.objects.filter(standard_status__iexact="Active")
+            if intent["rent"]:
+                qs = qs.filter(Q(lease_amount__gt=0) | Q(total_actual_rent__gt=0))
+            else:
+                qs = qs.filter(lease_amount__isnull=True, total_actual_rent__isnull=True)
+            if intent["city"]:
+                qs = qs.filter(city_match_q(intent["city"]))
+            if intent["beds"] is not None:
+                qs = qs.filter(bedrooms_total__gte=intent["beds"])
+            type_q = _home_type_q(intent["home_type"])
+            if type_q is not None:
+                qs = qs.filter(type_q)
+
+            total = qs.count()
             rows = list(
                 qs.order_by("-modification_timestamp").values(
-                    "listing_key", "unparsed_address", "city", "list_price", "bedrooms_total"
+                    "listing_key",
+                    "unparsed_address",
+                    "city",
+                    "list_price",
+                    "lease_amount",
+                    "total_actual_rent",
+                    "bedrooms_total",
+                    "property_sub_type",
                 )[:5]
             )
             context["active_listings"] = {
-                "city": city,
+                "city": intent["city"],
+                "match_count": total,
                 "sample": [
                     {
                         "address": row["unparsed_address"] or "",
-                        "city": row["city"] or city,
+                        "city": row["city"] or intent["city"] or "",
                         "list_price": float(row["list_price"]) if row["list_price"] is not None else None,
+                        "lease_amount": float(row["lease_amount"] or row["total_actual_rent"] or 0) or None,
                         "beds": row["bedrooms_total"],
+                        "type": row["property_sub_type"] or "",
                         "href": f"/property/{row['listing_key']}",
                     }
                     for row in rows
                     if row.get("listing_key")
                 ],
-                "note": "Sample of active listings currently in the catalogue, not a complete count.",
+                "results_href": search_href,
+                "note": "Sample of matching active listings. Use results_href for the full set.",
             }
         except Exception:
             logger.exception("assist listing context failed")
-            context["active_listings"] = {"city": city, "sample": []}
-
-    try:
-        projects = (
-            PreComProperty.objects.filter(content__status=Content.PUBLISH)
-            .select_related("content")
-            .order_by("-is_featured", "content__title")[:6]
-        )
-        context["preconstruction"] = [
-            {
-                "title": project.content.title,
-                "city": "",
-                "href": f"/preconstruction/{project.pk}-{project.content.slug}",
+            context["active_listings"] = {
+                "city": intent["city"],
+                "match_count": 0,
+                "sample": [],
+                "results_href": search_href,
             }
-            for project in projects
-        ]
-    except Exception:
-        logger.exception("assist precon context failed")
-        context["preconstruction"] = []
 
-    try:
-        assignments = ListingSubmission.objects.filter(
-            status=ListingSubmission.Status.APPROVED,
-            purpose=ListingSubmission.Purpose.ASSIGNMENT,
-        ).order_by("-submitted_at")[:5]
-        context["assignments"] = [
-            {
-                "address": f"{row.address_line_1}, {row.city}",
-                "asking_price": float(row.asking_price) if row.asking_price is not None else None,
-                "href": f"/assignments/{row.pk}",
-            }
-            for row in assignments
-        ]
-    except Exception:
-        logger.exception("assist assignment context failed")
-        context["assignments"] = []
+    if intent["wants_precon"] or not intent["wants_listings"]:
+        try:
+            projects = (
+                PreComProperty.objects.filter(content__status=Content.PUBLISH)
+                .select_related("content")
+                .order_by("-is_featured", "content__title")
+            )
+            if intent["city"]:
+                city = intent["city"]
+                projects = projects.filter(
+                    Q(address__icontains=city) | Q(content__title__icontains=city) | Q(developer_name__icontains=city)
+                )
+            projects = list(projects[:6])
+            context["preconstruction"] = [
+                {
+                    "title": project.content.title,
+                    "address": (project.address or "")[:120],
+                    "href": f"/preconstruction/{project.pk}-{project.content.slug}",
+                }
+                for project in projects
+            ]
+            context["preconstruction_href"] = (
+                f"/preconstruction?city={intent['city']}" if intent["city"] else "/preconstruction"
+            )
+        except Exception:
+            logger.exception("assist precon context failed")
+            context["preconstruction"] = []
+
+    if intent["wants_assignments"] or (not intent["wants_listings"] and not intent["wants_precon"]):
+        try:
+            assignments = ListingSubmission.objects.filter(
+                status=ListingSubmission.Status.APPROVED,
+                purpose=ListingSubmission.Purpose.ASSIGNMENT,
+            )
+            if intent["city"]:
+                assignments = assignments.filter(city__icontains=intent["city"])
+            assignments = list(assignments.order_by("-submitted_at")[:5])
+            context["assignments"] = [
+                {
+                    "address": f"{row.address_line_1}, {row.city}",
+                    "asking_price": float(row.asking_price) if row.asking_price is not None else None,
+                    "href": f"/assignments/{row.pk}",
+                }
+                for row in assignments
+            ]
+            context["assignments_href"] = "/assignments"
+        except Exception:
+            logger.exception("assist assignment context failed")
+            context["assignments"] = []
+
+    if intent["wants_market"]:
+        href = f"/market-trends?city={intent['city']}" if intent["city"] else "/market-trends"
+        context["market_trends"] = {
+            "href": href,
+            "note": "Open Market trends for sold prices, DOM and sale-to-list charts.",
+        }
 
     return context
 
 
 def _keyword_links(question: str) -> list[dict]:
-    text = question.lower()
-    picks = []
-    rules = (
-        (("condo", "house", "listing", "bed", "buy", "rent"), PAGES[0]),
-        (("map",), PAGES[1]),
-        (("market", "trend", "sold", "price"), PAGES[2]),
-        (("pre-con", "precon", "floor plan", "developer"), PAGES[3]),
-        (("assignment",), PAGES[4]),
-        (("value", "valuation", "worth", "estimate"), PAGES[5]),
-        (("sell", "list my"), PAGES[6]),
-        (("blog", "article", "news"), PAGES[7]),
-    )
-    for words, page in rules:
-        if any(word in text for word in words):
-            picks.append({"label": page["label"], "href": page["href"]})
+    intent = _parse_intent(question)
+    picks: list[dict] = []
+
+    if intent["wants_listings"] or intent["beds"] or intent["home_type"] or (
+        intent["city"] and not intent["wants_precon"] and not intent["wants_assignments"] and not intent["wants_market"]
+    ):
+        picks.append({"label": "See matching listings", "href": _listings_search_href(intent)})
+    if intent["wants_precon"]:
+        picks.append({"label": "Pre-construction", "href": "/preconstruction"})
+    if intent["wants_assignments"]:
+        picks.append({"label": "Assignments", "href": "/assignments"})
+    if intent["wants_market"]:
+        href = f"/market-trends?city={intent['city']}" if intent["city"] else "/market-trends"
+        picks.append({"label": "Market trends", "href": href})
+
+    if not picks:
+        text = question.lower()
+        rules = (
+            (("map",), PAGES[1]),
+            (("value", "valuation", "worth", "estimate"), PAGES[5]),
+            (("sell", "list my"), PAGES[6]),
+            (("blog", "article", "news"), PAGES[7]),
+            (("contact", "agent", "talk"), PAGES[9]),
+        )
+        for words, page in rules:
+            if any(word in text for word in words):
+                picks.append({"label": page["label"], "href": page["href"]})
     if not picks:
         picks.append({"label": PAGES[0]["label"], "href": PAGES[0]["href"]})
     return picks[:3]
 
 
 def _fallback(question: str, error: str = "") -> AssistResult:
+    intent = _parse_intent(question)
+    if intent["wants_listings"] or intent["beds"] or intent["home_type"]:
+        answer = (
+            "I can open a filtered listings search for that. "
+            "Use the link below, or ask for a city, beds or home type to narrow it."
+        )
+        handoff = "none"
+    elif intent["wants_precon"]:
+        answer = "Browse published pre-construction projects on this site from the link below."
+        handoff = "none"
+    elif intent["wants_assignments"]:
+        answer = "Approved assignment listings are collected on the Assignments page."
+        handoff = "none"
+    elif intent["wants_market"]:
+        answer = "Market trends for GTA cities are on the Market trends page."
+        handoff = "none"
+    else:
+        answer = (
+            "I can point you to the right page on this site — listings, "
+            "pre-construction, assignments or market trends. "
+            "For a person, use WhatsApp or Contact."
+        )
+        handoff = "contact"
+
     return AssistResult(
-        answer=(
-            "I can point you to the right page on this site. "
-            "For a person, use WhatsApp or the contact form on Market trends."
-        ),
+        answer=answer,
         links=_keyword_links(question),
-        handoff="contact",
+        handoff=handoff,
         fallback=True,
         error=error,
     )
@@ -303,9 +523,17 @@ def answer_question(question: str) -> AssistResult:
         fallback.latency_ms = latency_ms
         return fallback
 
+    links = _clean_links(payload.get("links"))
+    # Ensure search-style questions always keep a useful listings link.
+    intent = _parse_intent(question)
+    if (intent["wants_listings"] or intent["beds"] or intent["home_type"]) and not any(
+        link["href"].startswith("/listings") for link in links
+    ):
+        links = ([{"label": "See matching listings", "href": _listings_search_href(intent)}] + links)[:3]
+
     return AssistResult(
         answer=answer,
-        links=_clean_links(payload.get("links")),
+        links=links,
         handoff=handoff,
         fallback=False,
         model=result.model,
