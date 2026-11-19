@@ -394,6 +394,9 @@ class Command(BaseCommand):
                 ),
             },
         )
+        from mls.services.listing_sync_status import clear_cache as clear_listing_sync_status_cache
+
+        clear_listing_sync_status_cache()
 
         elapsed = time.time() - start_time
 

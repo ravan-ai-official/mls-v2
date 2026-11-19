@@ -2846,28 +2846,11 @@ class ListingSyncStatusAPIView(APIView):
     """Reports the last fully successful DDF listing import."""
 
     permission_classes = [AllowAny]
-    CACHE_KEY = "listing-sync-status:v2"
 
     def get(self, request):
-        cached = cache.get(self.CACHE_KEY)
-        if cached is not None:
-            return Response(cached)
-        sync_status = ListingSyncStatus.objects.filter(
-            key="ddf_properties"
-        ).first()
-        payload = {
-            "last_successful_at": (
-                sync_status.last_successful_at if sync_status else None
-            ),
-            # Rows downloaded by the last run, NOT the catalogue size.
-            "listing_count": sync_status.listing_count if sync_status else 0,
-            # What the site can show right now: the figure for "N live listings".
-            "active_listing_count": Property.objects.filter(
-                standard_status__iexact="Active"
-            ).count(),
-        }
-        cache.set(self.CACHE_KEY, payload, 300)
-        return Response(payload)
+        from .services.listing_sync_status import cached_payload
+
+        return Response(cached_payload())
 
 
 class ListingCatalogStatsAPIView(APIView):
