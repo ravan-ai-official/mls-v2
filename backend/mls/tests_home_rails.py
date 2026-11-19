@@ -76,6 +76,21 @@ class FeaturedPropertiesTests(TestCase):
     def test_bad_limit_is_400(self):
         self.assertEqual(self.client.get(FEATURED_URL, {"limit": "abc"}).status_code, 400)
 
+    def test_city_fill_follows_admin_pins(self):
+        _listing("pin", is_featured=True, featured_order=1, city="Toronto")
+        _listing("local-a", city="Oakville", days_old=2)
+        _listing("local-b", city="Oakville", days_old=1)
+        _listing("excl", remarks="EXCLUSIVE to our brokerage: corner lot", city="Toronto")
+
+        response = self.client.get(FEATURED_URL, {"limit": 3, "cities": "Oakville"})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["pinned_count"], 1)
+        self.assertGreaterEqual(body["local_count"], 1)
+        sources = [row["featured_source"] for row in body["results"]]
+        self.assertEqual(sources[0], "pinned")
+        self.assertIn("local", sources)
+
 
 class ExclusivePropertiesReadOnlyTests(TestCase):
     def setUp(self):

@@ -128,22 +128,97 @@ def schools_near(
 
 def top_gta_schools(*, limit: int = 4, schools: list[dict] | None = None) -> list[dict]:
     """GTA secondary schools with the highest average of published EQAO results."""
-    ranked = []
-    for school in schools if schools is not None else load_schools():
+    return top_secondary_schools(limit=limit, schools=schools)
+
+
+def top_secondary_schools(
+    *,
+    limit: int = 4,
+    cities: list[str] | None = None,
+    names: list[str] | None = None,
+    schools: list[dict] | None = None,
+) -> list[dict]:
+    """Secondary schools ranked by EQAO.
+
+    Admin/CMS ``names`` (when matched in the Ministry file) always lead.
+    Remaining slots prefer ``cities`` when provided, else the wider GTA box.
+    """
+    catalogue = schools if schools is not None else load_schools()
+    chosen: list[dict] = []
+    seen: set[str] = set()
+
+    def add(school: dict) -> None:
+        key = str(school.get("id") or school.get("name") or "")
+        if not key or key in seen or len(chosen) >= limit:
+            return
+        seen.add(key)
+        chosen.append(_public_school(school))
+
+    for name in names or []:
+        needle = _normalize_name(name)
+        if len(needle) < 2:
+            continue
+        best: tuple[float, dict] | None = None
+        for school in catalogue:
+            if (school.get("level") or "").lower() != "secondary":
+                continue
+            school_name = _normalize_name(school.get("name") or "")
+            if not school_name:
+                continue
+            if school_name == needle:
+                score = 100.0
+            elif school_name.startswith(needle) or needle in school_name:
+                score = 80.0
+            else:
+                continue
+            if eqao_percent(school) is None and score < 100.0:
+                continue
+            if best is None or score > best[0]:
+                best = (score, school)
+        if best:
+            add(best[1])
+        if len(chosen) >= limit:
+            return chosen
+
+    city_keys = {_normalize_name(city) for city in (cities or []) if city}
+    ranked: list[tuple[int, str, dict]] = []
+    for school in catalogue:
         if (school.get("level") or "").lower() != "secondary":
             continue
         lat = school.get("lat")
         lon = school.get("lon")
         if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
             continue
-        if not (_GTA["lat_min"] <= lat <= _GTA["lat_max"] and _GTA["lon_min"] <= lon <= _GTA["lon_max"]):
-            continue
         score = eqao_percent(school)
         if score is None:
             continue
+        school_city = _normalize_name(school.get("city") or "")
+        if city_keys:
+            if not school_city or not any(
+                school_city == key or school_city.startswith(key) or key in school_city
+                for key in city_keys
+            ):
+                continue
+        elif not (_GTA["lat_min"] <= lat <= _GTA["lat_max"] and _GTA["lon_min"] <= lon <= _GTA["lon_max"]):
+            continue
         ranked.append((score, school.get("name") or "", school))
     ranked.sort(key=lambda item: (-item[0], item[1]))
-    return [_public_school(school) for _, _, school in ranked[:limit]]
+    for _, _, school in ranked:
+        add(school)
+        if len(chosen) >= limit:
+            break
+
+    # If a city filter left the rail thin, top up from the wider GTA list.
+    if len(chosen) < limit and city_keys:
+        for row in top_secondary_schools(limit=limit, cities=None, names=None, schools=catalogue):
+            key = str(row.get("id") or row.get("name") or "")
+            if key and key not in seen:
+                seen.add(key)
+                chosen.append(row)
+            if len(chosen) >= limit:
+                break
+
+    return chosen[:limit]
 
 
 def _normalize_name(value: str) -> str:

@@ -4,7 +4,8 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from mls.services.ontario_schools import SOURCE, schools_near, search_schools, top_gta_schools
+from mls.services.ontario_schools import SOURCE, schools_near, search_schools, top_secondary_schools
+from mls.services.visitor_place import cities_for_request
 
 
 class SchoolsNearAPIView(APIView):
@@ -32,7 +33,11 @@ class SchoolsNearAPIView(APIView):
 
 
 class TopSchoolsAPIView(APIView):
-    """GET /api/mls/schools/top/?limit=4"""
+    """GET /api/mls/schools/top/?limit=4&cities=&names=
+
+    Admin/CMS school names (``names``) lead when they match the Ministry file.
+    Remaining slots prefer visitor cities (query or IP-city headers), else GTA.
+    """
 
     permission_classes = [AllowAny]
 
@@ -42,9 +47,20 @@ class TopSchoolsAPIView(APIView):
         except ValueError:
             return Response({"error": "limit must be a number."}, status=400)
         limit = min(8, max(1, limit))
+        cities = cities_for_request(request)
+        names = [
+            part.strip()
+            for part in (request.query_params.get("names") or "").replace("|", ",").split(",")
+            if part.strip()
+        ][:8]
         return Response({
             **SOURCE,
-            "schools": top_gta_schools(limit=limit),
+            "cities": cities,
+            "schools": top_secondary_schools(
+                limit=limit,
+                cities=cities or None,
+                names=names or None,
+            ),
         })
 
 

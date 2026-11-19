@@ -2021,21 +2021,23 @@ class FeaturedPropertiesAPIView(APIView):
     """
     GET /api/mls/properties/featured-properties/
 
-    Homepage Featured rail: listings an admin pinned (``is_featured``, in
-    ``featured_order``, until ``featured_until``) first, topped up with the
-    brokerage's exclusive listings when fewer than ``limit`` are pinned.
-    Sold and de-listed rows are left out of both.
+    Homepage Featured rail: admin pins first, then active listings in the
+    visitor's cities (search history / IP city), then exclusive fill.
+    Sold and de-listed rows are left out.
     """
 
     @extend_schema(
         summary="List featured properties",
         description=(
-            "Admin-pinned listings first (featured_order, then newest), then exclusive "
-            "listings to fill the rail. Each row carries featured_source: pinned | exclusive."
+            "Admin-pinned listings first (featured_order, then newest), then active "
+            "listings in cities=, then exclusive listings. Each row carries "
+            "featured_source: pinned | local | exclusive."
         ),
         parameters=[
             OpenApiParameter("limit", OpenApiTypes.INT, OpenApiParameter.QUERY, required=False, description="Rail size, 1–24. Defaults to 6."),
-            OpenApiParameter("fill", OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False, description="Top up with exclusive listings. Defaults to true."),
+            OpenApiParameter("fill", OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False, description="Top up after pins. Defaults to true."),
+            OpenApiParameter("cities", OpenApiTypes.STR, OpenApiParameter.QUERY, required=False, description="CSV of preferred cities from search history."),
+            OpenApiParameter("city", OpenApiTypes.STR, OpenApiParameter.QUERY, required=False, description="Single preferred city."),
         ],
         responses={
             200: OpenApiResponse(response=inline_serializer(
@@ -2043,6 +2045,7 @@ class FeaturedPropertiesAPIView(APIView):
                 fields={
                     "count": serializers.IntegerField(),
                     "pinned_count": serializers.IntegerField(),
+                    "local_count": serializers.IntegerField(),
                     "results": PropertySerializer(many=True),
                 },
             )),
@@ -2051,13 +2054,17 @@ class FeaturedPropertiesAPIView(APIView):
         auth=[],
     )
     def get(self, request):
+        from .services.visitor_place import cities_for_request
+
         try:
             limit = max(1, min(int(request.query_params.get("limit", 6)), 24))
         except (TypeError, ValueError):
             return Response({"error": "limit must be an integer."}, status=400)
         fill = str(request.query_params.get("fill", "true")).lower() not in {"0", "false", "no"}
+        cities = cities_for_request(request)
+        city_key = ",".join(c.lower() for c in cities) or "-"
 
-        cache_key = f"featured-properties:{limit}:{int(fill)}"
+        cache_key = f"featured-properties:{limit}:{int(fill)}:{city_key}"
         cached_payload = cache.get(cache_key)
         if cached_payload is not None:
             return Response(cached_payload)
@@ -2071,10 +2078,28 @@ class FeaturedPropertiesAPIView(APIView):
             .order_by(F("featured_order").asc(nulls_last=True), *newest)[:limit]
         )
         rows = [(p, "pinned") for p in pinned]
+        used_ids = {p.id for p in pinned}
+        local_count = 0
+
+        if fill and len(rows) < limit and cities:
+            city_q = Q()
+            for city in cities:
+                city_q |= Q(city__istartswith=city)
+            local = list(
+                Property.objects.filter(standard_status__iexact="active")
+                .filter(city_q)
+                .exclude(id__in=used_ids)
+                .exclude(INACTIVE_STATUS_Q)
+                .order_by(*newest)[: limit - len(rows)]
+            )
+            rows += [(p, "local") for p in local]
+            used_ids.update(p.id for p in local)
+            local_count = len(local)
+
         if fill and len(rows) < limit:
             exclusive = (
                 Property.objects.filter(id__in=_exclusive_ids_qs())
-                .exclude(id__in=[p.id for p in pinned])
+                .exclude(id__in=used_ids)
                 .exclude(INACTIVE_STATUS_Q)
                 .order_by(*newest)[: limit - len(rows)]
             )
@@ -2085,7 +2110,13 @@ class FeaturedPropertiesAPIView(APIView):
             {**data, "featured_source": source}
             for data, (_, source) in zip(serializer.data, rows)
         ]
-        payload = {"count": len(results), "pinned_count": len(pinned), "results": results}
+        payload = {
+            "count": len(results),
+            "pinned_count": len(pinned),
+            "local_count": local_count,
+            "cities": cities,
+            "results": results,
+        }
         cache.set(cache_key, payload, FEATURED_CACHE_TTL_SECONDS)
         return Response(payload)
 
