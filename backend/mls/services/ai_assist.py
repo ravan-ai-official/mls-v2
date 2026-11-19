@@ -168,29 +168,48 @@ def _parse_intent(question: str) -> dict:
             home_type = "Detached"
 
     rent = any(token in text for token in ("rent", "rental", "lease", "for lease"))
-    wants_listings = any(
-        token in text
-        for token in (
+    wants_precon = any(
+        token in text for token in ("pre-con", "precon", "pre construction", "pre-construction", "new build", "developer", "floor plan")
+    )
+    wants_assignments = "assignment" in text
+    wants_market = any(token in text for token in ("market", "trend", "sold data", "days on market", "sale-to-list"))
+
+    listing_cues = (
+        "listing",
+        "listings",
+        "condo",
+        "apartment",
+        "house",
+        "town",
+        "bed",
+        "buy",
+        "sale",
+        "rent",
+        "lease",
+        "home",
+        "property",
+        "properties",
+    )
+    wants_listings = any(token in text for token in listing_cues) or beds is not None or home_type is not None
+    # "Assignments for sale" is about contracts, not MLS inventory, unless the
+    # visitor also named beds / type / condo / rent / etc.
+    if wants_assignments and beds is None and home_type is None:
+        specific = (
             "listing",
             "listings",
             "condo",
+            "apartment",
             "house",
             "town",
             "bed",
-            "buy",
-            "sale",
             "rent",
             "lease",
             "home",
             "property",
             "properties",
         )
-    ) or beds is not None or home_type is not None
-    wants_precon = any(
-        token in text for token in ("pre-con", "precon", "pre construction", "pre-construction", "new build", "developer", "floor plan")
-    )
-    wants_assignments = "assignment" in text
-    wants_market = any(token in text for token in ("market", "trend", "sold data", "days on market", "sale-to-list"))
+        if not any(token in text for token in specific):
+            wants_listings = False
 
     return {
         "city": city,
@@ -217,6 +236,18 @@ def _listings_search_href(intent: dict) -> str:
     if intent.get("home_type"):
         params["type"] = intent["home_type"]
     return f"/listings?{urlencode(params)}" if params else "/listings"
+
+
+def _precon_href(intent: dict) -> str:
+    if intent.get("city"):
+        return f"/preconstruction?{urlencode({'city': intent['city']})}"
+    return "/preconstruction"
+
+
+def _assignments_href(intent: dict) -> str:
+    if intent.get("city"):
+        return f"/assignments?{urlencode({'city': intent['city']})}"
+    return "/assignments"
 
 
 def _safe_href(href: str) -> str | None:
@@ -373,9 +404,7 @@ def site_context(question: str) -> dict:
                 }
                 for project in projects
             ]
-            context["preconstruction_href"] = (
-                f"/preconstruction?city={intent['city']}" if intent["city"] else "/preconstruction"
-            )
+            context["preconstruction_href"] = _precon_href(intent)
         except Exception:
             logger.exception("assist precon context failed")
             context["preconstruction"] = []
@@ -397,13 +426,13 @@ def site_context(question: str) -> dict:
                 }
                 for row in assignments
             ]
-            context["assignments_href"] = "/assignments"
+            context["assignments_href"] = _assignments_href(intent)
         except Exception:
             logger.exception("assist assignment context failed")
             context["assignments"] = []
 
     if intent["wants_market"]:
-        href = f"/market-trends?city={intent['city']}" if intent["city"] else "/market-trends"
+        href = f"/market-trends?{urlencode({'city': intent['city']})}" if intent["city"] else "/market-trends"
         context["market_trends"] = {
             "href": href,
             "note": "Open Market trends for sold prices, DOM and sale-to-list charts.",
@@ -421,11 +450,11 @@ def _keyword_links(question: str) -> list[dict]:
     ):
         picks.append({"label": "See matching listings", "href": _listings_search_href(intent)})
     if intent["wants_precon"]:
-        picks.append({"label": "Pre-construction", "href": "/preconstruction"})
+        picks.append({"label": "Pre-construction", "href": _precon_href(intent)})
     if intent["wants_assignments"]:
-        picks.append({"label": "Assignments", "href": "/assignments"})
+        picks.append({"label": "Assignments", "href": _assignments_href(intent)})
     if intent["wants_market"]:
-        href = f"/market-trends?city={intent['city']}" if intent["city"] else "/market-trends"
+        href = f"/market-trends?{urlencode({'city': intent['city']})}" if intent["city"] else "/market-trends"
         picks.append({"label": "Market trends", "href": href})
 
     if not picks:
@@ -524,12 +553,22 @@ def answer_question(question: str) -> AssistResult:
         return fallback
 
     links = _clean_links(payload.get("links"))
-    # Ensure search-style questions always keep a useful listings link.
+    # Ensure intent chips always keep a useful on-site link even if the model
+    # omits one.
     intent = _parse_intent(question)
     if (intent["wants_listings"] or intent["beds"] or intent["home_type"]) and not any(
         link["href"].startswith("/listings") for link in links
     ):
         links = ([{"label": "See matching listings", "href": _listings_search_href(intent)}] + links)[:3]
+    if intent["wants_precon"] and not any(link["href"].startswith("/preconstruction") for link in links):
+        links = ([{"label": "Pre-construction", "href": _precon_href(intent)}] + links)[:3]
+    if intent["wants_assignments"] and not any(link["href"].startswith("/assignments") for link in links):
+        links = ([{"label": "Assignments", "href": _assignments_href(intent)}] + links)[:3]
+    if intent["wants_market"] and not any(link["href"].startswith("/market-trends") for link in links):
+        market_href = (
+            f"/market-trends?{urlencode({'city': intent['city']})}" if intent["city"] else "/market-trends"
+        )
+        links = ([{"label": "Market trends", "href": market_href}] + links)[:3]
 
     return AssistResult(
         answer=answer,

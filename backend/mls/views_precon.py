@@ -8,7 +8,7 @@ import requests
 from django.conf import settings
 from django.core import signing
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.http import StreamingHttpResponse
 from django.urls import reverse
 from django.utils.text import slugify
@@ -420,6 +420,7 @@ class PreComPropertyListAPIView(ListAPIView):
       keeps the historical ``-id`` order.
     - ``exclude_stage``: comma-separated ``sales_stage`` values to drop,
       e.g. ``sold_out``.
+    - ``city`` / ``search``: match address, title or developer (case-insensitive).
     """
 
     ORDERINGS = {
@@ -470,6 +471,13 @@ class PreComPropertyListAPIView(ListAPIView):
         stages = [s.strip() for s in (params.get("exclude_stage") or "").split(",") if s.strip()]
         if stages:
             qs = qs.exclude(sales_stage__in=stages)
+        place = (params.get("city") or params.get("search") or "").strip()
+        if place:
+            qs = qs.filter(
+                Q(address__icontains=place)
+                | Q(content__title__icontains=place)
+                | Q(developer_name__icontains=place)
+            )
         ordering = self.ORDERINGS.get((params.get("ordering") or "").strip().lower())
         if ordering:
             qs = qs.order_by(*ordering)
