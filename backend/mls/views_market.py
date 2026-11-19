@@ -35,6 +35,7 @@ from .services.query_helpers import (
     STATUS_GROUPS,
     apply_structure_filters,
     _apply_location_filters,
+    _build_search_q,
     cities_match_q,
     city_match_q,
     price_field_for,
@@ -60,10 +61,9 @@ PRICE_BUCKETS: list[tuple[int, int | None]] = [
 def _apply_facet_filters(qs, params) -> Any:
     """Reuse the filter surface of PropertyFilterView so facets match results.
 
-    Only the filters that are meaningful at aggregate time are applied here.
-    Text ``search``/``polygon`` are intentionally left out - they are handled
-    downstream in PropertyFilterView and would make facet counts diverge from
-    the paginated result.
+    Text ``search`` is applied the same way as listings filter so status-tab
+    counts stay aligned with ``?q=…`` result totals. Polygon stays out —
+    geo facets are expensive and rare on the listings strip.
     """
     if params.get("status"):
         qs = qs.filter(standard_status=params.get("status", "").strip())
@@ -71,6 +71,9 @@ def _apply_facet_filters(qs, params) -> Any:
         cities = [c.strip() for c in params.get("city", "").split(",") if c.strip()]
         if cities:
             qs = qs.filter(cities_match_q(cities))
+    search_term = (params.get("search") or "").strip()
+    if search_term:
+        qs = qs.filter(_build_search_q(search_term))
     if params.get("has_lease") in ("true", "1", "True"):
         qs = qs.filter(Q(lease_amount__gt=0) | Q(total_actual_rent__gt=0))
     # Buy / Rent split - the same rules as PropertyFilterView, so each status
