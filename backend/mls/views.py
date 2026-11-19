@@ -82,7 +82,7 @@ from mls.services.ai_listing_summary import (
     is_summary_complete,
     SUMMARY_PROMPT_VERSION,
 )
-from mls.services.recommendations import build_recommendation_payload
+from mls.services.recommendations import build_comparables_payload, build_recommendation_payload
 from mls.services.redis_cache import get_cached_open_houses
 
 logger = logging.getLogger(__name__)
@@ -1391,7 +1391,8 @@ class PropertyRecommendationsAPIView(APIView):
         limit = max(2, min(int(request.query_params.get("limit", "6")), 12))
         session_key = (request.query_params.get("session_key") or request.headers.get("X-Session-Key") or "")[:64]
         segment = f"user:{request.user.id}" if request.user.is_authenticated else f"session:{session_key or 'anon'}"
-        cache_key = f"recommendations:{listing_key}:{segment}:l{limit}"
+        # v2: stronger geo / home-type / size scoring — bust prior weak payloads.
+        cache_key = f"recommendations:v2:{listing_key}:{segment}:l{limit}"
         cached_payload = cache.get(cache_key)
         if cached_payload is not None:
             return Response(cached_payload, status=status.HTTP_200_OK)
@@ -1416,6 +1417,36 @@ class PropertyRecommendationsAPIView(APIView):
                 **rec_payload.get("metadata", {}),
                 "fallback_applied": rec_payload.get("fallback", {}).get("applied", False),
             },
+        }
+        cache.set(cache_key, response_payload, RECOMMENDATION_CACHE_TTL_SECONDS)
+        return Response(response_payload, status=status.HTTP_200_OK)
+
+
+class PropertyComparablesAPIView(APIView):
+    """Sold / for-sale / rent peers for the property detail Comparables tab."""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, listing_key):
+        listing_key = (listing_key or "").strip()
+        if not listing_key:
+            return Response({"error": "listing_key is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        prop = Property.objects.filter(listing_key=listing_key).first()
+        if not prop:
+            return Response({"error": "Property not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        limit = max(2, min(int(request.query_params.get("limit", "4")), 8))
+        cache_key = f"comparables:v1:{listing_key}:l{limit}"
+        cached_payload = cache.get(cache_key)
+        if cached_payload is not None:
+            return Response(cached_payload, status=status.HTTP_200_OK)
+
+        buckets = build_comparables_payload(target_property=prop, limit=limit)
+        response_payload = {
+            "sale": PropertySerializer(buckets.get("sale", []), many=True).data,
+            "sold": PropertySerializer(buckets.get("sold", []), many=True).data,
+            "rent": PropertySerializer(buckets.get("rent", []), many=True).data,
         }
         cache.set(cache_key, response_payload, RECOMMENDATION_CACHE_TTL_SECONDS)
         return Response(response_payload, status=status.HTTP_200_OK)

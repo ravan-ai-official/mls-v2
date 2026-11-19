@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Iterable
+from typing import Iterable, Optional
 
 from django.db.models import Count, Q
 from django.utils import timezone
 
 from mls.models import ListingViewEvent, Property, UserFavorite, UserHistory, UserPropertyInteraction, UserToured
+from mls.services.valuation.comps import haversine_km
 
 
 def _to_float(value):
@@ -41,56 +43,168 @@ def _comparison_price(property: Property):
     return _to_float(property.list_price)
 
 
+def _living_area(property: Property) -> Optional[float]:
+    for key in ("living_area", "living_area_minimum", "living_area_maximum"):
+        value = _to_float(getattr(property, key, None))
+        if value and value > 0:
+            return value
+    return None
+
+
+def _city_stem(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return value.split("(")[0].strip().lower()
+
+
+def _home_type_key(property: Property) -> Optional[str]:
+    """Canonical structure bucket so 'Single Family' condos are not peers of houses."""
+    structure = (property.structure_type or "").strip().lower()
+    attached = bool(property.property_attached_yn)
+    if structure == "apartment" or "apartment" in structure:
+        return "condo"
+    if structure.startswith("row") or "townhouse" in structure or "townhome" in structure:
+        return "townhouse"
+    if structure == "house":
+        return "semi" if attached else "detached"
+
+    sub = (property.property_sub_type or "").strip().lower()
+    if not sub:
+        return None
+    if any(token in sub for token in ("condo", "co-op", "coop", "apartment", "flat")):
+        return "condo"
+    if any(token in sub for token in ("town", "att/row", "row/", "freehold town")):
+        return "townhouse"
+    if "semi" in sub:
+        return "semi"
+    if any(token in sub for token in ("detached", "single family", "freehold")):
+        return "detached"
+    return None
+
+
+def _bbox(lat: float, lng: float, radius_km: float) -> dict[str, float]:
+    dlat = radius_km / 111.0
+    dlng = radius_km / max(111.0 * math.cos(math.radians(lat)), 1e-6)
+    return {
+        "lat_min": lat - dlat,
+        "lat_max": lat + dlat,
+        "lng_min": lng - dlng,
+        "lng_max": lng + dlng,
+    }
+
+
 @dataclass
 class _Weights:
-    content: float = float(os.environ.get("REC_WEIGHT_CONTENT", "0.55"))
-    personal: float = float(os.environ.get("REC_WEIGHT_PERSONAL", "0.30"))
-    collaborative: float = float(os.environ.get("REC_WEIGHT_COLLAB", "0.10"))
+    # Content dominates: clients care that similar homes look like the subject.
+    content: float = float(os.environ.get("REC_WEIGHT_CONTENT", "0.70"))
+    personal: float = float(os.environ.get("REC_WEIGHT_PERSONAL", "0.18"))
+    collaborative: float = float(os.environ.get("REC_WEIGHT_COLLAB", "0.07"))
     freshness: float = float(os.environ.get("REC_WEIGHT_FRESHNESS", "0.05"))
 
 
 def _score_content(target: Property, candidate: Property) -> tuple[float, list[str]]:
     score = 0.0
     reasons: list[str] = []
-    if target.city and candidate.city and target.city.lower() == candidate.city.lower():
-        score += 0.35
-        reasons.append("same_city")
-    if (
+
+    tlat, tlng = _to_float(target.latitude), _to_float(target.longitude)
+    clat, clng = _to_float(candidate.latitude), _to_float(candidate.longitude)
+    if None not in (tlat, tlng, clat, clng):
+        distance = haversine_km(tlat, tlng, clat, clng)
+        if distance <= 1.0:
+            score += 0.30
+            reasons.append("very_nearby")
+        elif distance <= 3.0:
+            score += 0.24
+            reasons.append("nearby")
+        elif distance <= 6.0:
+            score += 0.16
+            reasons.append("same_area")
+        elif distance <= 12.0:
+            score += 0.08
+        else:
+            score -= 0.12
+    else:
+        t_city, c_city = _city_stem(target.city), _city_stem(candidate.city)
+        if t_city and c_city and t_city == c_city:
+            score += 0.18
+            reasons.append("same_city")
+        elif target.city_region and candidate.city_region and target.city_region.lower() == candidate.city_region.lower():
+            score += 0.10
+            reasons.append("same_region")
+
+    t_hood = (target.subdivision_name or target.city_region or "").strip().lower()
+    c_hood = (candidate.subdivision_name or candidate.city_region or "").strip().lower()
+    if t_hood and c_hood and t_hood == c_hood:
+        score += 0.10
+        reasons.append("same_neighbourhood")
+
+    t_type, c_type = _home_type_key(target), _home_type_key(candidate)
+    if t_type and c_type:
+        if t_type == c_type:
+            score += 0.28
+            reasons.append("same_home_type")
+        else:
+            # Mixing condo with detached is the main client complaint.
+            score -= 0.35
+    elif (
         target.property_sub_type
         and candidate.property_sub_type
         and target.property_sub_type.lower() == candidate.property_sub_type.lower()
     ):
-        score += 0.30
+        score += 0.18
         reasons.append("same_type")
+
     target_price = _comparison_price(target)
     candidate_price = _comparison_price(candidate)
     if target_price and candidate_price:
         delta = abs(candidate_price - target_price) / max(target_price, 1)
-        if delta <= 0.10:
-            score += 0.25
+        if delta <= 0.08:
+            score += 0.22
             reasons.append("similar_rent" if _is_rental(target) else "similar_price")
-        elif delta <= 0.25:
-            score += 0.15
+        elif delta <= 0.18:
+            score += 0.14
             reasons.append("close_rent" if _is_rental(target) else "close_price")
-        elif delta <= 0.40:
-            score += 0.08
+        elif delta <= 0.30:
+            score += 0.07
+        elif delta > 0.55:
+            score -= 0.18
+
     target_beds = _to_int(target.bedrooms_total)
     candidate_beds = _to_int(candidate.bedrooms_total)
     if target_beds is not None and candidate_beds is not None:
-        if target_beds == candidate_beds:
-            score += 0.10
+        gap = abs(target_beds - candidate_beds)
+        if gap == 0:
+            score += 0.12
             reasons.append("same_beds")
-        elif abs(target_beds - candidate_beds) == 1:
+        elif gap == 1:
             score += 0.05
+        else:
+            score -= 0.10
+
     target_baths = _to_int(target.bathrooms_total_integer)
     candidate_baths = _to_int(candidate.bathrooms_total_integer)
     if target_baths is not None and candidate_baths is not None:
-        if target_baths == candidate_baths:
-            score += 0.08
+        gap = abs(target_baths - candidate_baths)
+        if gap == 0:
+            score += 0.07
             reasons.append("same_baths")
-        elif abs(target_baths - candidate_baths) == 1:
-            score += 0.04
-    return min(score, 1.0), reasons
+        elif gap == 1:
+            score += 0.03
+        else:
+            score -= 0.04
+
+    t_sqft, c_sqft = _living_area(target), _living_area(candidate)
+    if t_sqft and c_sqft:
+        sqft_delta = abs(c_sqft - t_sqft) / max(t_sqft, 1)
+        if sqft_delta <= 0.10:
+            score += 0.12
+            reasons.append("similar_size")
+        elif sqft_delta <= 0.20:
+            score += 0.06
+        elif sqft_delta > 0.45:
+            score -= 0.10
+
+    return max(0.0, min(score, 1.0)), reasons
 
 
 def _score_freshness(candidate: Property) -> float:
@@ -187,37 +301,75 @@ def build_recommendation_payload(
         )
 
     broad_candidates_qs = candidates_qs
-    if target_property.city:
+    tlat = _to_float(target_property.latitude)
+    tlng = _to_float(target_property.longitude)
+    if tlat is not None and tlng is not None:
+        box = _bbox(tlat, tlng, 12.0)
         candidates_qs = candidates_qs.filter(
-            Q(city__iexact=target_property.city) | Q(city_region__iexact=target_property.city_region or "")
+            latitude__gte=box["lat_min"],
+            latitude__lte=box["lat_max"],
+            longitude__gte=box["lng_min"],
+            longitude__lte=box["lng_max"],
         )
+    elif target_property.city:
+        city = target_property.city.split("(")[0].strip()
+        candidates_qs = candidates_qs.filter(
+            Q(city__istartswith=city) | Q(city_region__iexact=target_property.city_region or "")
+        )
+
+    beds = _to_int(target_property.bedrooms_total)
+    if beds is not None:
+        candidates_qs = candidates_qs.filter(
+            bedrooms_total__gte=max(0, beds - 1),
+            bedrooms_total__lte=beds + 1,
+        )
+
     base_price = _comparison_price(target_property)
     if base_price:
+        lo, hi = base_price * 0.60, base_price * 1.50
         if _is_rental(target_property):
             candidates_qs = candidates_qs.filter(
-                Q(lease_amount__gte=base_price * 0.55, lease_amount__lte=base_price * 1.65)
-                | Q(
-                    total_actual_rent__gte=base_price * 0.55,
-                    total_actual_rent__lte=base_price * 1.65,
-                )
+                Q(lease_amount__gte=lo, lease_amount__lte=hi)
+                | Q(total_actual_rent__gte=lo, total_actual_rent__lte=hi)
             )
         else:
-            candidates_qs = candidates_qs.filter(
-                list_price__gte=base_price * 0.55,
-                list_price__lte=base_price * 1.65,
-            )
-    candidates = list(candidates_qs.order_by("-modification_timestamp")[:220])
+            candidates_qs = candidates_qs.filter(list_price__gte=lo, list_price__lte=hi)
+
+    home_type = _home_type_key(target_property)
+    if home_type and target_property.structure_type:
+        # Prefer same structure when the feed has it; subtype-only subjects skip this.
+        structure = (target_property.structure_type or "").strip()
+        if structure:
+            candidates_qs = candidates_qs.filter(structure_type__iexact=structure)
+
+    candidates = list(candidates_qs.order_by("-modification_timestamp")[:280])
 
     # Sparse markets should still have useful suggestions. Relax city/price only
     # after preserving transaction type, and never mix rentals with sales.
-    if len(candidates) < limit_per_section:
+    if len(candidates) < max(limit_per_section * 2, 8):
         existing_keys = [candidate.listing_key for candidate in candidates]
-        candidates.extend(
-            list(
-                broad_candidates_qs.exclude(listing_key__in=existing_keys)
-                .order_by("-modification_timestamp")[: 220 - len(candidates)]
+        relaxed = broad_candidates_qs.exclude(listing_key__in=existing_keys)
+        if tlat is not None and tlng is not None:
+            box = _bbox(tlat, tlng, 25.0)
+            relaxed = relaxed.filter(
+                latitude__gte=box["lat_min"],
+                latitude__lte=box["lat_max"],
+                longitude__gte=box["lng_min"],
+                longitude__lte=box["lng_max"],
             )
-        )
+        elif target_property.city:
+            city = target_property.city.split("(")[0].strip()
+            relaxed = relaxed.filter(city__istartswith=city)
+        if base_price:
+            lo, hi = base_price * 0.45, base_price * 1.80
+            if _is_rental(target_property):
+                relaxed = relaxed.filter(
+                    Q(lease_amount__gte=lo, lease_amount__lte=hi)
+                    | Q(total_actual_rent__gte=lo, total_actual_rent__lte=hi)
+                )
+            else:
+                relaxed = relaxed.filter(list_price__gte=lo, list_price__lte=hi)
+        candidates.extend(list(relaxed.order_by("-modification_timestamp")[: 280 - len(candidates)]))
 
     ranked: list[dict] = []
     for candidate in candidates:
@@ -260,7 +412,7 @@ def build_recommendation_payload(
                 break
         return out
 
-    for_this_home = _section(ranked, lambda row: row["content_score"] >= 0.45)
+    for_this_home = _section(ranked, lambda row: row["content_score"] >= 0.38)
     based_on_history = (
         _section(
             ranked,

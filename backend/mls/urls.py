@@ -137,6 +137,7 @@ urlpatterns = [
     path('catalog-stats/bulk/', CatalogStatsBulkAPIView.as_view(), name='catalog-stats-bulk'),
     path('stats/platform/', PlatformStatsAPIView.as_view(), name='stats-platform'),
     path('properties/<str:listing_key>/recommendations/', PropertyRecommendationsAPIView.as_view(), name='property-recommendations'),
+    path('properties/<str:listing_key>/comparables/', PropertyComparablesAPIView.as_view(), name='property-comparables'),
     path('properties/recommendations/track/', RecommendationTrackAPIView.as_view(), name='property-recommendations-track'),
     path('properties/ai-summary/', ListingAISummaryAPIView.as_view(), name='listing-ai-summary'),
     path('properties/lease-properties/', LeasePropertiesAPIView.as_view(), name='lease-properties'),
