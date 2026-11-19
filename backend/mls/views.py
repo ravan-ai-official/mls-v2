@@ -1,4 +1,4 @@
-﻿import requests
+import requests
 import hashlib
 import os
 import json
@@ -1461,15 +1461,17 @@ class RecommendationTrackAPIView(APIView):
 class PropertyTypesAPIView(APIView):
     """
     GET /api/mls/properties/property-types/
-    Returns available property_sub_type values with counts.
-    Optional query params:
+    Returns UI home-type counts (Detached / Semi-Detached / Townhome / Condo)
+    plus Luxury ($2M+ active sales) and Rental (active leases). Optional:
       - province (comma-separated province codes, e.g. ON,QC)
       - listing_type: all | exclusive | lease | precon | community
     """
 
     def get(self, request):
+        from mls.services.query_helpers import HOME_TYPE_Q
+
         params = request.query_params
-        cache_key = _build_query_params_cache_key("property-types", params)
+        cache_key = _build_query_params_cache_key("property-types-ui", params)
         cached_payload = cache.get(cache_key)
         if cached_payload is not None:
             return Response(cached_payload, status=status.HTTP_200_OK)
@@ -1498,21 +1500,62 @@ class PropertyTypesAPIView(APIView):
                 Q(intro__contains="exclusive") | Q(category_type=Property.EXCLUSIVE)
             )
 
-        type_rows = (
-            qs.exclude(property_sub_type__isnull=True)
-            .exclude(property_sub_type__exact="")
-            .values("property_sub_type")
-            .annotate(count=Count("id"))
-            .order_by("-count", "property_sub_type")
+        sale_qs = qs.filter(
+            standard_status__iexact="Active",
+            list_price__gt=0,
+            lease_amount__isnull=True,
+            total_actual_rent__isnull=True,
         )
+        rental_qs = qs.filter(standard_status__iexact="Active").filter(
+            Q(lease_amount__gt=0) | Q(total_actual_rent__gt=0)
+        )
+
+        counts = sale_qs.aggregate(
+            detached=Count("id", filter=HOME_TYPE_Q["detached"]),
+            semi=Count("id", filter=HOME_TYPE_Q["semi"]),
+            townhome=Count("id", filter=HOME_TYPE_Q["townhouse"]),
+            condo=Count("id", filter=HOME_TYPE_Q["condo"]),
+            luxury=Count("id", filter=Q(list_price__gte=2_000_000)),
+        )
+        rental_count = rental_qs.count()
 
         results = [
             {
-                "value": row["property_sub_type"],
-                "label": row["property_sub_type"],
-                "count": row["count"],
-            }
-            for row in type_rows
+                "value": "Detached",
+                "label": "Detached",
+                "count": counts["detached"] or 0,
+                "ui_type": "Detached",
+            },
+            {
+                "value": "Semi-Detached",
+                "label": "Semi-Detached",
+                "count": counts["semi"] or 0,
+                "ui_type": "Semi-Detached",
+            },
+            {
+                "value": "Townhome",
+                "label": "Townhome",
+                "count": counts["townhome"] or 0,
+                "ui_type": "Townhome",
+            },
+            {
+                "value": "Condo",
+                "label": "Condo",
+                "count": counts["condo"] or 0,
+                "ui_type": "Condo",
+            },
+            {
+                "value": "Luxury",
+                "label": "Luxury",
+                "count": counts["luxury"] or 0,
+                "ui_type": "Luxury",
+            },
+            {
+                "value": "Rental",
+                "label": "Rental",
+                "count": rental_count,
+                "ui_type": "Rental",
+            },
         ]
 
         payload = {"results": results}
