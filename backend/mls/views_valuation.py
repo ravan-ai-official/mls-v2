@@ -101,22 +101,35 @@ class ValuationAutocompleteAPIView(APIView):
             return Response({"results": []}, status=status.HTTP_200_OK)
 
         lim = 10
-        qs = (
-            Property.objects.filter(
-                Q(unparsed_address__icontains=q)
-                | Q(street_name__icontains=q)
-                | Q(listing_key__icontains=q)
-                | Q(listing_id__icontains=q)
-            )
-            .only(
-                "listing_key",
-                "unparsed_address",
-                "city",
-                "postal_code",
-                "latitude",
-                "longitude",
-            )[:lim]
+        # Prefer rows that already have coordinates so the estimate step can
+        # run without a geocode round-trip. Still include others as a fallback.
+        matched = Property.objects.filter(
+            Q(unparsed_address__icontains=q)
+            | Q(street_name__icontains=q)
+            | Q(listing_key__icontains=q)
+            | Q(listing_id__icontains=q)
+        ).only(
+            "listing_key",
+            "unparsed_address",
+            "city",
+            "postal_code",
+            "latitude",
+            "longitude",
         )
+        with_coords = list(
+            matched.exclude(latitude__isnull=True)
+            .exclude(longitude__isnull=True)[:lim]
+        )
+        qs = with_coords
+        if len(qs) < lim:
+            seen = {p.listing_key for p in qs}
+            for row in matched[:lim]:
+                if row.listing_key in seen:
+                    continue
+                qs.append(row)
+                if len(qs) >= lim:
+                    break
+
         results = []
         for p in qs:
             fsa = _fsa_from_postal(p.postal_code)
@@ -181,10 +194,34 @@ class ValuationEstimateAPIView(APIView):
         if lng is None and prop and prop.longitude is not None:
             lng = float(prop.longitude)
 
+        # Many DDF rows ship without coordinates. Geocode the address so the
+        # CMA can still find nearby comps instead of failing the funnel.
+        if lat is None or lng is None:
+            from mls.services.valuation.geocode import geocode_address
+
+            address_bits = [
+                (prop.unparsed_address if prop else "") or body.get("address") or "",
+                city,
+                "Ontario",
+                "Canada",
+            ]
+            query = ", ".join(part.strip() for part in address_bits if str(part).strip())
+            geo_lat, geo_lng = geocode_address(query)
+            if geo_lat is not None and geo_lng is not None:
+                lat, lng = geo_lat, geo_lng
+                if prop is not None and (prop.latitude is None or prop.longitude is None):
+                    Property.objects.filter(pk=prop.pk).update(
+                        latitude=geo_lat,
+                        longitude=geo_lng,
+                    )
+
         if lat is None or lng is None:
             return Response(
                 {
-                    "detail": "latitude and longitude are required for an estimate (lookup a listing first).",
+                    "detail": (
+                        "We couldn't locate this address on the map. "
+                        "Try another nearby listing, or ask an agent for a manual CMA."
+                    ),
                     "estimate": {
                         "low": 0,
                         "market": 0,
