@@ -45,6 +45,7 @@ from .views_precon import (
 )
 from .views_search import SearchSuggestAPIView
 from .views_featured_studio import StudioFeaturedAPIView
+from .views_high_return_studio import StudioHighReturnAPIView
 from .views_studio import (
     StudioPreconAssetUploadAPIView,
     StudioPreconDetailAPIView,
@@ -102,6 +103,7 @@ urlpatterns = [
     path('activity/precon/', PreconActivityAPIView.as_view(), name='precon-activity'),
     path('studio/activity/', StudioActivityAPIView.as_view(), name='studio-activity'),
     path('studio/featured/', StudioFeaturedAPIView.as_view(), name='studio-featured'),
+    path('studio/high-return/', StudioHighReturnAPIView.as_view(), name='studio-high-return'),
     path('push/vapid/', PushVapidAPIView.as_view(), name='push-vapid'),
     path('push/subscribe/', PushSubscribeAPIView.as_view(), name='push-subscribe'),
     path('properties/featured-properties/', FeaturedPropertiesAPIView.as_view(), name='featured_properties'),

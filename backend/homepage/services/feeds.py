@@ -110,8 +110,28 @@ def _ampre_primary_photos(mls_numbers: Iterable[str]) -> dict[str, str]:
 # --------------------------------------------------------------------------
 
 
+def _investor_result_row(r: dict[str, Any], photos: dict[str, str], *, pinned: bool) -> dict[str, Any]:
+    return {
+        "listing_key": r["listing_key"],
+        "address": r["address"],
+        "city": base_city(r["city"]),
+        "bedrooms": r["bedrooms"],
+        "bathrooms": r["bathrooms"],
+        "list_price": to_float(r["price"]),
+        "image_url": photos.get(r["listing_key"]),
+        "estimated_monthly_rent": r["metrics"].estimated_monthly_rent,
+        "gross_yield_pct": r["metrics"].gross_yield_pct,
+        "cap_rate_pct": r["metrics"].cap_rate_pct,
+        "comps_used": r["metrics"].comps_used,
+        "source": "pinned" if pinned else "ranked",
+    }
+
+
 def investor_picks(limit: int = 3, city: str | None = None) -> dict[str, Any]:
     def build() -> dict[str, Any]:
+        from django.db.models import F
+
+        now = timezone.now()
         base = Property.objects.filter(standard_status__iexact="active").filter(_gta_q())
         # Rentals: a monthly rent and no sale price (how DDF carries leases).
         comps = [
@@ -119,15 +139,15 @@ def investor_picks(limit: int = 3, city: str | None = None) -> dict[str, Any]:
             for c, b, r in base.filter(total_actual_rent__gt=0, list_price__isnull=True)
             .values_list("city", "bedrooms_total", "total_actual_rent")
         ]
-        sales = base.filter(
-            list_price__gt=0,
-            bedrooms_total__gt=0,
-            bedrooms_total__lte=INVESTOR_MAX_BEDROOMS,
-            property_sub_type__in=RESIDENTIAL_SUB_TYPES,
+
+        pin_qs = (
+            Property.objects.filter(is_high_return=True, standard_status__iexact="active")
+            .filter(Q(high_return_until__isnull=True) | Q(high_return_until__gt=now))
+            .order_by(F("high_return_order").asc(nulls_last=True), "-listing_key")
         )
         if city:
-            sales = sales.filter(city__istartswith=city)
-        candidates = [
+            pin_qs = pin_qs.filter(city__istartswith=city)
+        pin_candidates = [
             {
                 "listing_key": row["listing_key"],
                 "address": row["unparsed_address"] or "",
@@ -139,31 +159,77 @@ def investor_picks(limit: int = 3, city: str | None = None) -> dict[str, Any]:
                 "condo_fee": row["association_fee"],
                 "condo_fee_frequency": row["association_fee_frequency"],
             }
-            for row in sales.order_by("-original_entry_timestamp").values(
-                "listing_key", "unparsed_address", "city", "bedrooms_total",
-                "bathrooms_total_integer", "list_price", "tax_annual_amount",
-                "association_fee", "association_fee_frequency",
-            )[:INVESTOR_CANDIDATE_POOL]
+            for row in pin_qs.values(
+                "listing_key",
+                "unparsed_address",
+                "city",
+                "bedrooms_total",
+                "bathrooms_total_integer",
+                "list_price",
+                "tax_annual_amount",
+                "association_fee",
+                "association_fee_frequency",
+            )[:limit]
         ]
-        ranked = rank_candidates(candidates, comps, limit)
-        photos = _photos(r["listing_key"] for r in ranked)
+        # Score pins for yield metrics but keep admin order (not yield rank).
+        pinned_rows: list[dict[str, Any]] = []
+        if pin_candidates:
+            scored_pins = {
+                row["listing_key"]: row
+                for row in rank_candidates(pin_candidates, comps, limit=len(pin_candidates))
+            }
+            pinned_rows = [
+                scored_pins[c["listing_key"]]
+                for c in pin_candidates
+                if c["listing_key"] in scored_pins
+            ]
+        pinned_keys = {r["listing_key"] for r in pinned_rows}
+
+        fill_needed = max(0, limit - len(pinned_rows))
+        ranked: list[dict[str, Any]] = []
+        if fill_needed:
+            sales = base.filter(
+                list_price__gt=0,
+                bedrooms_total__gt=0,
+                bedrooms_total__lte=INVESTOR_MAX_BEDROOMS,
+                property_sub_type__in=RESIDENTIAL_SUB_TYPES,
+            ).exclude(listing_key__in=pinned_keys)
+            if city:
+                sales = sales.filter(city__istartswith=city)
+            candidates = [
+                {
+                    "listing_key": row["listing_key"],
+                    "address": row["unparsed_address"] or "",
+                    "city": row["city"] or "",
+                    "bedrooms": row["bedrooms_total"],
+                    "bathrooms": row["bathrooms_total_integer"],
+                    "price": row["list_price"],
+                    "annual_tax": row["tax_annual_amount"],
+                    "condo_fee": row["association_fee"],
+                    "condo_fee_frequency": row["association_fee_frequency"],
+                }
+                for row in sales.order_by("-original_entry_timestamp").values(
+                    "listing_key",
+                    "unparsed_address",
+                    "city",
+                    "bedrooms_total",
+                    "bathrooms_total_integer",
+                    "list_price",
+                    "tax_annual_amount",
+                    "association_fee",
+                    "association_fee_frequency",
+                )[:INVESTOR_CANDIDATE_POOL]
+            ]
+            ranked = rank_candidates(candidates, comps, fill_needed)
+
+        combined = pinned_rows + ranked
+        photos = _photos(r["listing_key"] for r in combined)
         return {
             "results": [
-                {
-                    "listing_key": r["listing_key"],
-                    "address": r["address"],
-                    "city": base_city(r["city"]),
-                    "bedrooms": r["bedrooms"],
-                    "bathrooms": r["bathrooms"],
-                    "list_price": to_float(r["price"]),
-                    "image_url": photos.get(r["listing_key"]),
-                    "estimated_monthly_rent": r["metrics"].estimated_monthly_rent,
-                    "gross_yield_pct": r["metrics"].gross_yield_pct,
-                    "cap_rate_pct": r["metrics"].cap_rate_pct,
-                    "comps_used": r["metrics"].comps_used,
-                }
-                for r in ranked
+                _investor_result_row(r, photos, pinned=i < len(pinned_rows))
+                for i, r in enumerate(combined)
             ],
+            "pinned_count": len(pinned_rows),
             "calc_basis": CALC_BASIS,
             "generated_at": timezone.now().isoformat(),
         }

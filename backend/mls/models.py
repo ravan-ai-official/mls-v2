@@ -87,6 +87,17 @@ class Property(models.Model):
     featured_until = models.DateTimeField(
         null=True, blank=True, help_text="Stop featuring after this time. Blank = until unticked."
     )
+    is_high_return = models.BooleanField(
+        default=False, db_index=True, help_text="Pin this listing to the homepage High return rail."
+    )
+    high_return_order = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Position in the High return rail (1 = first). Blank sorts after numbered ones.",
+    )
+    high_return_until = models.DateTimeField(
+        null=True, blank=True, help_text="Stop pinning after this time. Blank = until unticked."
+    )
     is_manual = models.BooleanField(default=False, help_text="If true, automated sync will not overwrite this listing")
     listing_key = models.CharField(max_length=2000, unique=True)
     property_sub_type = models.CharField(max_length=2000, null=True, blank=True)
