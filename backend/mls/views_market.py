@@ -1169,8 +1169,71 @@ def get_recent_sales(city: str, days: int) -> list[dict[str, Any]]:
     return rows
 
 
+# Sell-page / UI labels → SOLD_PROPERTY_TYPES keys (plus luxury price band).
+RECENT_SALES_TYPE_ALIASES: dict[str, str] = {
+    "detached": "detached",
+    "semi": "semi",
+    "semi-detached": "semi",
+    "semi_detached": "semi",
+    "townhome": "townhouse",
+    "townhouse": "townhouse",
+    "condo": "condo_apartment",
+    "condo_apartment": "condo_apartment",
+    "condo_townhouse": "condo_townhouse",
+    "luxury": "luxury",
+}
+LUXURY_CLOSE_PRICE_MIN = 1_500_000
+
+
+def _parse_min_int(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    text = str(raw).strip().lower().replace("+", "")
+    if not text:
+        return None
+    try:
+        value = int(float(text))
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def filter_recent_sales(
+    rows: list[dict[str, Any]],
+    *,
+    property_type: str | None = None,
+    beds_min: int | None = None,
+    baths_min: int | None = None,
+) -> list[dict[str, Any]]:
+    """Apply type / beds / baths on top of a city+days recent-sales cache."""
+    type_key = RECENT_SALES_TYPE_ALIASES.get((property_type or "").strip().lower())
+    prefixes = SOLD_PROPERTY_TYPES.get(type_key or "", None) if type_key and type_key != "luxury" else None
+
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        if type_key == "luxury":
+            price = row.get("close_price") or 0
+            if float(price) < LUXURY_CLOSE_PRICE_MIN:
+                continue
+        elif prefixes:
+            sub = (row.get("property_sub_type") or "").strip()
+            if not any(sub.startswith(prefix) for prefix in prefixes):
+                continue
+        if beds_min is not None:
+            beds = row.get("bedrooms")
+            if beds is None or int(beds) < beds_min:
+                continue
+        if baths_min is not None:
+            baths = row.get("bathrooms")
+            if baths is None or int(baths) < baths_min:
+                continue
+        filtered.append(row)
+    return filtered
+
+
 class RecentSalesAPIView(APIView):
-    """GET /api/mls/market/recent-sales/?city=&days=30&page=1 — recently sold homes.
+    """GET /api/mls/market/recent-sales/?city=&days=30&page=1
+    [&property_type=&beds_min=&baths_min=] — recently sold homes.
 
     Signed-in users only. TRREB's VOW rules require a registered, signed-in
     user before sold prices are shown (the same reason HouseSigma gates them),
@@ -1193,6 +1256,9 @@ class RecentSalesAPIView(APIView):
             page = max(1, int(request.query_params.get("page") or 1))
         except ValueError:
             page = 1
+        property_type = (request.query_params.get("property_type") or "").strip()[:40]
+        beds_min = _parse_min_int(request.query_params.get("beds_min") or request.query_params.get("beds"))
+        baths_min = _parse_min_int(request.query_params.get("baths_min") or request.query_params.get("baths"))
         try:
             rows = get_recent_sales(city, days)
         except AmpreClientError as exc:
@@ -1201,6 +1267,12 @@ class RecentSalesAPIView(APIView):
                 {"error": "Sold data is temporarily unavailable."},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
+        rows = filter_recent_sales(
+            rows,
+            property_type=property_type or None,
+            beds_min=beds_min,
+            baths_min=baths_min,
+        )
         start = (page - 1) * RECENT_SALES_PAGE_SIZE
         return Response(
             {
@@ -1210,6 +1282,9 @@ class RecentSalesAPIView(APIView):
                 "page": page,
                 "page_size": RECENT_SALES_PAGE_SIZE,
                 "truncated": len(rows) >= RECENT_SALES_MAX_ROWS,
+                "property_type": property_type or None,
+                "beds_min": beds_min,
+                "baths_min": baths_min,
                 "results": rows[start:start + RECENT_SALES_PAGE_SIZE],
             }
         )

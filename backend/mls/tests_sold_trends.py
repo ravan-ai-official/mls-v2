@@ -161,6 +161,25 @@ class RecentSalesTests(SimpleTestCase):
         self.assertEqual(response.data["count"], 30)
         self.assertEqual(len(response.data["results"]), 30 - views_market.RECENT_SALES_PAGE_SIZE)
 
+    def test_filters_by_property_type_and_beds(self):
+        from types import SimpleNamespace
+        from rest_framework.test import APIRequestFactory, force_authenticate
+
+        rows = [
+            views_market._recent_sale_row({**self.RAW, "ListingKey": "D1", "PropertySubType": "Detached", "BedroomsTotal": 4}),
+            views_market._recent_sale_row({**self.RAW, "ListingKey": "S1", "PropertySubType": "Semi-Detached", "BedroomsTotal": 3}),
+            views_market._recent_sale_row({**self.RAW, "ListingKey": "C1", "PropertySubType": "Condo Apartment", "BedroomsTotal": 2}),
+        ]
+        request = APIRequestFactory().get(
+            "/x",
+            {"city": "Brampton", "days": "90", "property_type": "Detached", "beds_min": "4"},
+        )
+        force_authenticate(request, user=SimpleNamespace(is_authenticated=True))
+        with mock.patch.object(views_market, "get_recent_sales", return_value=rows):
+            response = views_market.RecentSalesAPIView.as_view()(request)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["listing_key"], "D1")
+
 
 
 class ClientIpValidationTests(SimpleTestCase):
