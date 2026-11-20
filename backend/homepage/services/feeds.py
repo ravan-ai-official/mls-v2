@@ -34,7 +34,30 @@ INVESTOR_CANDIDATE_POOL = 600
 # rental comps are whole-building rents; they swamp the ranking with yields
 # a typical investor can't reproduce, so the feed sticks to 1–5 bedrooms.
 INVESTOR_MAX_BEDROOMS = 5
-RESIDENTIAL_SUB_TYPES = ("Single Family", "Multi-family")
+# DDF / PropTX residential labels used in the live GTA catalogue. The old
+# ("Single Family", "Multi-family") pair matched almost nothing, so the rail
+# stayed empty even when rents and sale inventory were plentiful.
+RESIDENTIAL_SUB_TYPES = (
+    "Detached",
+    "Semi-Detached",
+    "Att/Row/Townhouse",
+    "Condo Apartment",
+    "Condo Townhouse",
+    "Link",
+    "Duplex",
+    "Triplex",
+    "Fourplex",
+    "Multiplex",
+    "Detached Condo",
+    "Semi-Detached Condo",
+    "Common Element Condo",
+    "Single Family",
+    "Multi-family",
+)
+# Monthly rents often land in list_price too; anything below this is not a sale.
+MIN_SALE_PRICE = 150_000
+# Asking-rent sanity band for comps (monthly).
+RENT_COMP_RANGE = (500, 20_000)
 
 
 class FeedUnavailable(RuntimeError):
@@ -130,14 +153,23 @@ def _investor_result_row(r: dict[str, Any], photos: dict[str, str], *, pinned: b
 def investor_picks(limit: int = 3, city: str | None = None) -> dict[str, Any]:
     def build() -> dict[str, Any]:
         from django.db.models import F
+        from django.db.models.functions import Coalesce
 
         now = timezone.now()
         base = Property.objects.filter(standard_status__iexact="active").filter(_gta_q())
-        # Rentals: a monthly rent and no sale price (how DDF carries leases).
+        # Rentals: lease_amount OR total_actual_rent (DDF often also fills list_price
+        # with the monthly rent, so we must NOT require list_price IS NULL).
+        rent_lo, rent_hi = RENT_COMP_RANGE
+        rental_rows = (
+            base.filter(Q(lease_amount__gt=0) | Q(total_actual_rent__gt=0))
+            .annotate(rent_amount=Coalesce("lease_amount", "total_actual_rent"))
+            .filter(rent_amount__gte=rent_lo, rent_amount__lte=rent_hi)
+            .values_list("city", "bedrooms_total", "rent_amount")
+        )
         comps = [
             RentalComp(city=c or "", bedrooms=b, monthly_rent=float(r))
-            for c, b, r in base.filter(total_actual_rent__gt=0, list_price__isnull=True)
-            .values_list("city", "bedrooms_total", "total_actual_rent")
+            for c, b, r in rental_rows
+            if r is not None
         ]
 
         pin_qs = (
@@ -188,12 +220,17 @@ def investor_picks(limit: int = 3, city: str | None = None) -> dict[str, Any]:
         fill_needed = max(0, limit - len(pinned_rows))
         ranked: list[dict[str, Any]] = []
         if fill_needed:
-            sales = base.filter(
-                list_price__gt=0,
-                bedrooms_total__gt=0,
-                bedrooms_total__lte=INVESTOR_MAX_BEDROOMS,
-                property_sub_type__in=RESIDENTIAL_SUB_TYPES,
-            ).exclude(listing_key__in=pinned_keys)
+            # Sale homes only: exclude leases and monthly-rent-sized list prices.
+            sales = (
+                base.filter(
+                    list_price__gte=MIN_SALE_PRICE,
+                    bedrooms_total__gt=0,
+                    bedrooms_total__lte=INVESTOR_MAX_BEDROOMS,
+                    property_sub_type__in=RESIDENTIAL_SUB_TYPES,
+                    lease_amount__isnull=True,
+                    total_actual_rent__isnull=True,
+                ).exclude(listing_key__in=pinned_keys)
+            )
             if city:
                 sales = sales.filter(city__istartswith=city)
             candidates = [
@@ -234,7 +271,8 @@ def investor_picks(limit: int = 3, city: str | None = None) -> dict[str, Any]:
             "generated_at": timezone.now().isoformat(),
         }
 
-    return _cached(f"home:investor:{limit}:{(city or '').lower()}", INVESTOR_TTL, build)
+    # v2 busts the empty cache left by the old subtype / rental-comp filters.
+    return _cached(f"home:investor:v2:{limit}:{(city or '').lower()}", INVESTOR_TTL, build)
 
 
 # --------------------------------------------------------------------------
