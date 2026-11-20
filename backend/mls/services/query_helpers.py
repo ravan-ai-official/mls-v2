@@ -440,6 +440,21 @@ def _apply_fallback_pipeline(base_qs, params, order_by: tuple[str, ...]):
             "suggested_locations": [],
         }
 
+    # An explicit search / city / postal must never widen into "nearby cities
+    # without the search term" or the unfiltered catalogue — that produces
+    # tab counts of 0 with a full page of unrelated homes.
+    has_place_intent = bool(
+        (params.get("search") or "").strip()
+        or (params.get("city") or "").strip()
+        or (params.get("postal_code") or "").strip()
+    )
+    if has_place_intent:
+        return strict, {
+            "fallback_applied": False,
+            "fallback_stage": None,
+            "suggested_locations": [],
+        }
+
     location_hint = params.get("search") or params.get("city") or params.get("postal_code") or ""
     suggestions = _candidate_cities(base_qs, location_hint)
     if suggestions:

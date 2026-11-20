@@ -230,9 +230,11 @@ def _build_status_group_q(raw_value: str | None):
     if not groups:
         return None
 
+    # Keep in sync with mls.services.query_helpers.STATUS_GROUPS so any path
+    # that still uses this helper matches facet / filter tab counts.
     group_to_statuses = {
-        "active": {"active", "a"},
-        "sold": {"sold", "closed", "leased"},
+        "active": {"active", "a", "active under contract", "coming soon", "pending"},
+        "sold": {"sold", "closed", "leased", "rented"},
         "de-listed": {
             "delisted",
             "de-listed",
@@ -242,6 +244,8 @@ def _build_status_group_q(raw_value: str | None):
             "cancelled",
             "canceled",
             "withdrawn",
+            "hold",
+            "off market",
         },
     }
     q = Q()
@@ -449,6 +453,18 @@ def _apply_fallback_pipeline(base_qs, params, order_by: tuple[str, ...]):
         return relaxed, {
             "fallback_applied": True,
             "fallback_stage": "relaxed_location",
+            "suggested_locations": [],
+        }
+
+    has_place_intent = bool(
+        (params.get("search") or "").strip()
+        or (params.get("city") or "").strip()
+        or (params.get("postal_code") or "").strip()
+    )
+    if has_place_intent:
+        return strict, {
+            "fallback_applied": False,
+            "fallback_stage": None,
             "suggested_locations": [],
         }
 
