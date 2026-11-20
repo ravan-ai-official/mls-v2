@@ -3,10 +3,11 @@
 Method, returned with every result as ``calc_basis`` so the UI can disclose it:
 
 1. **Rent** — median asking rent of active *rental* listings in the same base
-   city with the same bedroom count. Rentals are rows with a monthly
-   ``total_actual_rent`` and no ``list_price`` (how the DDF feed carries
-   leases). At least ``MIN_COMPS`` comparables are required; with fewer, the
-   bedroom match widens to ±1, and with fewer still no estimate is made.
+   city with the same bedroom count. Rentals are rows with
+   ``lease_amount`` or ``total_actual_rent`` (DDF may also mirror that monthly
+   rent into ``list_price``). At least ``MIN_COMPS`` comparables are required;
+   with fewer, the bedroom match widens to ±1, and with fewer still no
+   estimate is made.
 2. **Gross yield** = annual rent ÷ list price.
 3. **Cap rate** = (annual rent × (1 − vacancy) − property tax − condo fees −
    maintenance allowance) ÷ list price. Financing is excluded, as is standard
