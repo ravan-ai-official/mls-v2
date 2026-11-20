@@ -288,6 +288,119 @@ GTA_CITIES: list[str] = [
     "Milton",
 ]
 
+MARKET_CITIES_CACHE_KEY = "market-cities:v1"
+MARKET_CITIES_CACHE_TTL = 60 * 30
+
+
+def _city_base_name(raw: str) -> str:
+    """Strip neighbourhood qualifiers: 'Toronto (Annex)' → 'Toronto'."""
+    value = (raw or "").strip()
+    if " (" in value:
+        value = value.split(" (", 1)[0].strip()
+    return value
+
+
+def _market_cities_from_db(limit: int = 24) -> list[dict[str, Any]]:
+    """Distinct Ontario cities with inventory, collapsed to base names."""
+    rows = (
+        Property.objects.exclude(city__isnull=True)
+        .exclude(city__exact="")
+        .filter(Q(state_or_province__iexact="ON") | Q(state_or_province__istartswith="Ontario"))
+        .values("city")
+        .annotate(
+            listing_count=Count("id"),
+            active_count=Count("id", filter=Q(standard_status__iexact="Active")),
+        )
+        .order_by("-active_count", "-listing_count")[:800]
+    )
+
+    preferred = {name.lower(): name for name in GTA_CITIES}
+    buckets: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        base = _city_base_name(str(row["city"] or ""))
+        if len(base) < 2:
+            continue
+        key = base.lower()
+        # Prefer the canonical GTA spelling when we know it.
+        name = preferred.get(key, base)
+        bucket = buckets.get(key)
+        if bucket is None:
+            buckets[key] = {
+                "name": name,
+                "active_count": int(row["active_count"] or 0),
+                "listing_count": int(row["listing_count"] or 0),
+            }
+        else:
+            bucket["active_count"] += int(row["active_count"] or 0)
+            bucket["listing_count"] += int(row["listing_count"] or 0)
+            if preferred.get(key):
+                bucket["name"] = preferred[key]
+
+    ranked = sorted(
+        buckets.values(),
+        key=lambda item: (-item["active_count"], -item["listing_count"], item["name"].lower()),
+    )
+    # Keep cities that actually have inventory; prefer ones with actives first.
+    usable = [item for item in ranked if item["listing_count"] > 0]
+    return usable[: max(1, min(limit, 40))]
+
+
+class MarketCitiesAPIView(APIView):
+    """GET /api/market/cities/ — cities for the Market Insights dropdown."""
+
+    permission_classes = [AllowAny]
+
+    @extend_schema(
+        summary="Cities available for market insights",
+        description=(
+            "Returns Ontario cities present in the MLS feed, collapsed from "
+            "neighbourhood-qualified spellings (e.g. 'Toronto (Annex)' → 'Toronto') "
+            "and ordered by active inventory. Powers the Market Insights city filter."
+        ),
+        parameters=[
+            OpenApiParameter(
+                "limit",
+                OpenApiTypes.INT,
+                OpenApiParameter.QUERY,
+                required=False,
+                description="Max cities to return (default 24, max 40).",
+            ),
+        ],
+        responses={
+            200: OpenApiResponse(
+                response=inline_serializer(
+                    name="MarketCitiesResponse",
+                    fields={
+                        "cities": serializers.ListField(child=serializers.DictField()),
+                    },
+                )
+            ),
+        },
+        auth=[],
+    )
+    def get(self, request):
+        try:
+            limit = int(request.query_params.get("limit") or 24)
+        except (TypeError, ValueError):
+            limit = 24
+        limit = max(1, min(limit, 40))
+
+        cache_key = f"{MARKET_CITIES_CACHE_KEY}:{limit}"
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
+        cities = _market_cities_from_db(limit)
+        if not cities:
+            # Feed empty / filter too tight — still expose the known GTA set.
+            cities = [
+                {"name": name, "active_count": 0, "listing_count": 0} for name in GTA_CITIES[:limit]
+            ]
+
+        payload = {"cities": cities}
+        cache.set(cache_key, payload, MARKET_CITIES_CACHE_TTL)
+        return Response(payload)
+
 
 def _sold_bucket() -> dict[str, list[float]]:
     return {"prices": [], "dom": [], "ratios": [], "count": []}
