@@ -408,6 +408,11 @@ def _is_falsy(value) -> bool:
 
 
 def _apply_fallback_pipeline(base_qs, params, order_by: tuple[str, ...]):
+    """Apply listing filters.
+
+    Fallback (relaxed city → nearby cities → whole catalogue) is opt-in via
+    ``allow_fallback=true``. Default is strict: no matches means an empty page.
+    """
     strict = _apply_common_filters(
         base_qs, params, include_search=True, include_location=True, relaxed_city=False
     )
@@ -419,10 +424,9 @@ def _apply_fallback_pipeline(base_qs, params, order_by: tuple[str, ...]):
             "suggested_locations": [],
         }
 
-    # GAP-02: strict mode returns an empty result set instead of falling
-    # through to the safety_net stage that returns the entire catalog.
+    # Default off: empty beats substitute listings that look like matches.
     allow_fallback_raw = params.get("allow_fallback")
-    if allow_fallback_raw is not None and _is_falsy(allow_fallback_raw):
+    if allow_fallback_raw is None or not _is_truthy(allow_fallback_raw):
         return strict, {
             "fallback_applied": False,
             "fallback_stage": None,
@@ -437,21 +441,6 @@ def _apply_fallback_pipeline(base_qs, params, order_by: tuple[str, ...]):
         return relaxed, {
             "fallback_applied": True,
             "fallback_stage": "relaxed_location",
-            "suggested_locations": [],
-        }
-
-    # An explicit search / city / postal must never widen into "nearby cities
-    # without the search term" or the unfiltered catalogue — that produces
-    # tab counts of 0 with a full page of unrelated homes.
-    has_place_intent = bool(
-        (params.get("search") or "").strip()
-        or (params.get("city") or "").strip()
-        or (params.get("postal_code") or "").strip()
-    )
-    if has_place_intent:
-        return strict, {
-            "fallback_applied": False,
-            "fallback_stage": None,
             "suggested_locations": [],
         }
 

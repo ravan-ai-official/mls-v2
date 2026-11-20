@@ -438,9 +438,23 @@ def _apply_common_filters(
 
 
 def _apply_fallback_pipeline(base_qs, params, order_by: tuple[str, ...]):
+    """Apply listing filters. Fallback is opt-in via allow_fallback=true."""
     strict = _apply_common_filters(base_qs, params, include_search=True, include_location=True, relaxed_city=False)
     strict = strict.order_by(*order_by)
     if strict.exists():
+        return strict, {
+            "fallback_applied": False,
+            "fallback_stage": None,
+            "suggested_locations": [],
+        }
+
+    allow_fallback_raw = params.get("allow_fallback")
+    if allow_fallback_raw is None or str(allow_fallback_raw).strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
         return strict, {
             "fallback_applied": False,
             "fallback_stage": None,
@@ -453,18 +467,6 @@ def _apply_fallback_pipeline(base_qs, params, order_by: tuple[str, ...]):
         return relaxed, {
             "fallback_applied": True,
             "fallback_stage": "relaxed_location",
-            "suggested_locations": [],
-        }
-
-    has_place_intent = bool(
-        (params.get("search") or "").strip()
-        or (params.get("city") or "").strip()
-        or (params.get("postal_code") or "").strip()
-    )
-    if has_place_intent:
-        return strict, {
-            "fallback_applied": False,
-            "fallback_stage": None,
             "suggested_locations": [],
         }
 

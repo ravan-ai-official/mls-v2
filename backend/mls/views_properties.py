@@ -105,7 +105,7 @@ class PropertyFilterView(APIView):
             OpenApiParameter("has_open_house", OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False, description="Restrict to listings with an upcoming open house (defaults to today onwards)."),
             OpenApiParameter("open_house_from", OpenApiTypes.DATE, OpenApiParameter.QUERY, required=False, description="Open-house date lower bound (YYYY-MM-DD)."),
             OpenApiParameter("open_house_to", OpenApiTypes.DATE, OpenApiParameter.QUERY, required=False, description="Open-house date upper bound (YYYY-MM-DD)."),
-            OpenApiParameter("allow_fallback", OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False, description="Set to false to disable the relaxed/nearby/safety-net fallback and return count=0 on no-match."),
+            OpenApiParameter("allow_fallback", OpenApiTypes.BOOL, OpenApiParameter.QUERY, required=False, description="Opt-in only. Default is strict: no matches returns count=0. Set true to enable relaxed/nearby/safety-net fallback."),
         ],
         responses={
             200: OpenApiResponse(response=inline_serializer(
